@@ -200,3 +200,205 @@ def _has_token_mention(text_lower: str, token: str) -> bool:
 
     pattern = r"(?<![\w])@" + re.escape(token) + r"(?![\w])"
     return bool(re.search(pattern, text_lower))
+
+
+# ---------------------------------------------------------------------------
+# Rocket.Chat REST client
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RocketChatIdentity:
+    """Identity information returned after authentication."""
+
+    user_id: str = ""
+    username: str = ""
+    name: str = ""
+    auth_token: str = ""
+
+
+class RocketChatClientError(Exception):
+    """Raised when a Rocket.Chat API call fails."""
+
+
+class RocketChatClient:
+    """Async REST client for the Rocket.Chat API.
+
+    Handles authentication (token or password), message sending,
+    attachment download, and file upload.
+    """
+
+    def __init__(
+        self,
+        server_url: str,
+        user_id: str = "",
+        access_token: str = "",
+        username: str = "",
+        password: str = "",
+    ):
+        self._server_url = server_url.rstrip("/")
+        self._user_id = user_id
+        self._access_token = access_token
+        self._username = username
+        self._password = password
+        self._identity: RocketChatIdentity | None = None
+
+    @property
+    def identity(self) -> RocketChatIdentity | None:
+        return self._identity
+
+    @property
+    def server_url(self) -> str:
+        return self._server_url
+
+    # -- subclasses / tests override this to inject fake HTTP sessions --------
+
+    async def _get_session(self):
+        """Return an aiohttp ClientSession (lazy import to keep deps optional)."""
+        try:
+            import aiohttp
+            return aiohttp.ClientSession()
+        except ImportError:
+            import httpx
+            return httpx.AsyncClient()
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        json: dict | None = None,
+        headers: dict | None = None,
+        raw: bool = False,
+    ):
+        """Make an HTTP request to the Rocket.Chat REST API."""
+        url = f"{self._server_url}{path}"
+        default_headers = {
+            "X-User-Id": self._user_id,
+            "X-Auth-Token": self._access_token,
+        }
+        if headers:
+            default_headers.update(headers)
+
+        session = await self._get_session()
+
+        # Support both aiohttp and httpx session shapes
+        if hasattr(session, "request"):
+            # httpx.AsyncClient
+            async with session:
+                resp = await session.request(
+                    method, url, json=json, headers=default_headers
+                )
+                if raw:
+                    return await resp.aread() if hasattr(resp, "aread") else await resp.read()
+                return await resp.json()
+        else:
+            # aiohttp.ClientSession
+            async with session.request(
+                method, url, json=json, headers=default_headers
+            ) as resp:
+                if raw:
+                    return await resp.read()
+                return await resp.json()
+
+    # -- authentication ------------------------------------------------------
+
+    async def initialize(self) -> RocketChatIdentity:
+        """Authenticate and return the bot identity."""
+        if self._username and self._password:
+            return await self._login_password()
+        else:
+            return await self._verify_token()
+
+    async def _verify_token(self) -> RocketChatIdentity:
+        """Verify a pre-configured user ID + access token via /api/v1/me."""
+        try:
+            data = await self._request("GET", "/api/v1/me")
+        except Exception as exc:
+            raise RocketChatClientError(f"Token verification failed: {exc}") from exc
+
+        if not data.get("success", False) and not data.get("_id"):
+            raise RocketChatClientError("Token verification failed: invalid response")
+
+        identity = RocketChatIdentity(
+            user_id=data.get("_id", self._user_id),
+            username=data.get("username", ""),
+            name=data.get("name", ""),
+            auth_token=self._access_token,
+        )
+        self._identity = identity
+        return identity
+
+    async def _login_password(self) -> RocketChatIdentity:
+        """Authenticate with username + password via /api/v1/login."""
+        try:
+            data = await self._request(
+                "POST",
+                "/api/v1/login",
+                json={"user": self._username, "password": self._password},
+                headers={},  # no auth headers yet
+            )
+        except Exception as exc:
+            raise RocketChatClientError(f"Password login failed: {exc}") from exc
+
+        if data.get("status") != "success":
+            msg = data.get("message", data.get("error", "unknown error"))
+            raise RocketChatClientError(f"Password login failed: {msg}")
+
+        auth_data = data.get("data", data)
+        self._user_id = auth_data.get("userId", "")
+        self._access_token = auth_data.get("authToken", "")
+
+        identity = RocketChatIdentity(
+            user_id=self._user_id,
+            username=self._username,
+            name="",
+            auth_token=self._access_token,
+        )
+        self._identity = identity
+        return identity
+
+    # -- send ----------------------------------------------------------------
+
+    async def post_message(
+        self,
+        room_id: str,
+        text: str,
+        tmid: str = "",
+    ) -> dict:
+        """Send a chat message via /api/v1/chat.postMessage."""
+        payload: dict[str, Any] = {
+            "roomId": room_id,
+            "text": text,
+        }
+        if tmid:
+            payload["tmid"] = tmid
+
+        data = await self._request("POST", "/api/v1/chat.postMessage", json=payload)
+
+        if not data.get("success", False):
+            msg = data.get("error", "chat.postMessage failed")
+            raise RocketChatClientError(f"Send failed: {msg}")
+
+        return data.get("message", {})
+
+    # -- download ------------------------------------------------------------
+
+    async def download_attachment(self, url: str) -> bytes:
+        """Download a protected Rocket.Chat file attachment with auth headers."""
+        headers = {
+            "X-User-Id": self._user_id,
+            "X-Auth-Token": self._access_token,
+        }
+        session = await self._get_session()
+
+        if hasattr(session, "request"):
+            # httpx.AsyncClient
+            async with session:
+                resp = await session.get(url, headers=headers)
+                resp.raise_for_status()
+                return await resp.aread() if hasattr(resp, "aread") else await resp.read()
+        else:
+            # aiohttp.ClientSession
+            async with session.get(url, headers=headers) as resp:
+                resp.raise_for_status()
+                return await resp.read()
