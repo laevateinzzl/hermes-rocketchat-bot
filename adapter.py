@@ -1490,6 +1490,25 @@ RocketChatClient.upload_attachment = _client_upload_attachment  # type: ignore[m
 # ---------------------------------------------------------------------------
 
 
+def check_requirements() -> tuple[bool, str]:
+    """Check that aiohttp or httpx is available for the Rocket.Chat adapter.
+
+    Returns ``(ok, message)`` where *ok* is ``True`` when at least one HTTP
+    library is importable.
+    """
+    try:
+        import aiohttp  # noqa: F401
+        return True, "aiohttp available"
+    except ImportError:
+        pass
+    try:
+        import httpx  # noqa: F401
+        return True, "httpx available"
+    except ImportError:
+        pass
+    return False, "Missing HTTP library — install aiohttp or httpx"
+
+
 def register(ctx: Any) -> None:
     """Register the Rocket.Chat platform adapter with the Hermes plugin system.
 
@@ -1500,6 +1519,7 @@ def register(ctx: Any) -> None:
         name="rocketchat",
         label="Rocket.Chat",
         adapter_factory=lambda cfg: RocketChatAdapter(cfg),
+        check_fn=check_requirements,
         env_enablement_fn=env_enablement,
         standalone_sender_fn=standalone_send,
         required_env=["ROCKETCHAT_SERVER_URL", "ROCKETCHAT_AUTH_MODE"],

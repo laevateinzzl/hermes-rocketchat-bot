@@ -30,6 +30,7 @@ def test_register_declares_platform_hooks():
 
     # Hook presence
     assert callable(platform["adapter_factory"])
+    assert callable(platform["check_fn"])
     assert callable(platform["env_enablement_fn"])
     assert callable(platform["standalone_sender_fn"])
 
