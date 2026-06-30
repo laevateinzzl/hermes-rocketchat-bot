@@ -15,17 +15,37 @@ to the Hermes messaging gateway.
 
 ## Installation
 
-Copy (or symlink) this repository into the Hermes plugins directory:
+### Option A: Git install (recommended)
+
+If the repository is hosted on GitHub/GitLab:
 
 ```bash
+hermes plugins install <owner/repo>
+# or with full URL
+hermes plugins install https://github.com/<owner>/hermes-rocketchat-bot.git
+```
+
+### Option B: Manual copy
+
+```bash
+mkdir -p ~/.hermes/plugins
 cp -r hermes-rocketchat-bot ~/.hermes/plugins/rocketchat
 ```
 
-Or clone directly:
+### Option C: Symlink (development)
 
 ```bash
-git clone <repo-url> ~/.hermes/plugins/rocketchat
+mkdir -p ~/.hermes/plugins
+ln -s "$(pwd)/hermes-rocketchat-bot" ~/.hermes/plugins/rocketchat
 ```
+
+### Verify installation
+
+```bash
+hermes plugins list
+```
+
+The plugin name `rocketchat-platform` should appear in the list.
 
 ### Dependencies
 
