@@ -402,3 +402,164 @@ class RocketChatClient:
             async with session.get(url, headers=headers) as resp:
                 resp.raise_for_status()
                 return await resp.read()
+
+
+# ---------------------------------------------------------------------------
+# Attachment handling
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AttachmentCandidate:
+    """Normalized attachment extracted from a Rocket.Chat message."""
+
+    url: str = ""
+    mime_type: str = ""
+    title: str = ""
+    rc_file_id: str = ""
+
+
+def attachment_candidates_from_message(message: dict) -> list[AttachmentCandidate]:
+    """Extract attachment candidates from a Rocket.Chat message.
+
+    Handles three Rocket.Chat attachment shapes:
+    - ``attachments``: array of rich attachment objects with ``image_url`` or ``title_link``
+    - ``file``: single file object with ``_id``, ``name``, ``type``
+    - ``files``: array of file objects
+    """
+    candidates: list[AttachmentCandidate] = []
+
+    # attachments field (rich link previews / image embeds)
+    for att in message.get("attachments") or []:
+        url = att.get("image_url") or att.get("title_link") or ""
+        if url:
+            candidates.append(
+                AttachmentCandidate(
+                    url=url,
+                    mime_type=att.get("image_type", ""),
+                    title=att.get("title", ""),
+                )
+            )
+
+    # files field (array, modern Rocket.Chat)
+    for f in message.get("files") or []:
+        candidates.append(
+            AttachmentCandidate(
+                url=_file_url_from_rc(f, message),
+                mime_type=f.get("type", ""),
+                title=f.get("name", ""),
+                rc_file_id=f.get("_id", ""),
+            )
+        )
+
+    # file field (single object, older Rocket.Chat)
+    single = message.get("file")
+    if single:
+        candidates.append(
+            AttachmentCandidate(
+                url=_file_url_from_rc(single, message),
+                mime_type=single.get("type", ""),
+                title=single.get("name", ""),
+                rc_file_id=single.get("_id", ""),
+            )
+        )
+
+    return candidates
+
+
+def _file_url_from_rc(file_obj: dict, message: dict) -> str:
+    """Build a Rocket.Chat file download URL from a file object."""
+    rid = message.get("rid", "")
+    fid = file_obj.get("_id", "")
+    if fid and rid:
+        return f"/file-upload/{rid}/{fid}/{file_obj.get('name', 'file')}"
+    return ""
+
+
+def classify_attachment(candidate: AttachmentCandidate) -> str:
+    """Map an attachment candidate to a Hermes media type string.
+
+    Returns one of: ``"image"``, ``"document"``, ``"video"``, ``"audio"``.
+    """
+    mime = candidate.mime_type.lower()
+
+    if mime.startswith("image/"):
+        return "image"
+    if mime.startswith("video/"):
+        return "video"
+    if mime.startswith("audio/"):
+        return "audio"
+
+    # Fallback: classify by file extension
+    from pathlib import Path
+    ext = Path(candidate.title).suffix.lower() if candidate.title else ""
+
+    image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".tiff"}
+    video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
+    audio_exts = {".mp3", ".ogg", ".wav", ".flac", ".aac", ".m4a", ".wma", ".opus"}
+
+    if ext in image_exts:
+        return "image"
+    if ext in video_exts:
+        return "video"
+    if ext in audio_exts:
+        return "audio"
+
+    return "document"
+
+
+def sanitize_filename(name: str) -> str:
+    """Sanitize a filename to be safe for local filesystem storage."""
+    import re
+
+    name = name.replace("/", "_").replace("\\", "_").replace("\x00", "")
+    name = re.sub(r"[\x00-\x1f]", "", name)
+    name = name.lstrip(".") or "file"
+    return name
+
+
+async def resolve_message_media(
+    message: dict,
+    client: Any,
+    cache_dir: str = "",
+) -> tuple[list[str], list[str]]:
+    """Download attachments into cache and return (media_urls, media_types).
+
+    Returns two parallel lists suitable for Hermes ``MessageEvent`` fields.
+    """
+    candidates = attachment_candidates_from_message(message)
+    if not candidates:
+        return [], []
+
+    media_urls: list[str] = []
+    media_types: list[str] = []
+
+    for candidate in candidates:
+        media_type = classify_attachment(candidate)
+        local_path = ""
+
+        if cache_dir and candidate.url:
+            safe_name = sanitize_filename(candidate.title or "attachment")
+            from pathlib import Path
+            dest = Path(cache_dir) / safe_name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                data = await client.download_attachment(candidate.url)
+                dest.write_bytes(data)
+                local_path = str(dest)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Failed to download attachment: %s", candidate.url
+                )
+                continue
+        elif candidate.url:
+            local_path = candidate.url
+        else:
+            continue
+
+        media_urls.append(local_path)
+        media_types.append(media_type)
+
+    return media_urls, media_types
