@@ -40,11 +40,13 @@ class RocketChatConfig:
     max_message_length: int = 4000
 
 
-def _parse_bool(value: str | None) -> bool:
-    """Parse a boolean from an environment variable string."""
+def _parse_bool(value: Any | None) -> bool:
+    """Parse a boolean from an environment variable string or native bool."""
     if value is None:
         return False
-    return value.strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _parse_float_safe(value: Any, default: float = 0.0) -> float:
@@ -63,11 +65,17 @@ def _parse_int_safe(value: Any, default: int = 0) -> int:
         return default
 
 
-def _parse_csv(value: str | None) -> list[str]:
-    """Parse a comma-separated value into a list of trimmed non-empty strings."""
+def _parse_csv(value: str | list[str] | None) -> list[str]:
+    """Parse a comma-separated value into a list of trimmed non-empty strings.
+
+    Also accepts a list directly (Hermes may pass native list types via
+    ``PlatformConfig.extra``).
+    """
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
     if not value:
         return []
-    return [item.strip() for item in value.split(",") if item.strip()]
+    return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
 def parse_config(extra: dict[str, Any] | None = None) -> RocketChatConfig:
