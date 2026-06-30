@@ -1,0 +1,52 @@
+name: rocketchat-platform
+label: Rocket.Chat
+kind: platform
+version: 0.1.0
+description: Rocket.Chat gateway adapter for Hermes Agent
+author: hermes-rocketchat-bot
+requires_env:
+  - name: ROCKETCHAT_SERVER_URL
+    description: Rocket.Chat server URL, e.g. https://chat.example.com
+    prompt: Rocket.Chat server URL
+    password: false
+  - name: ROCKETCHAT_AUTH_MODE
+    description: "Authentication mode: token or password"
+    prompt: Auth mode
+    password: false
+optional_env:
+  - name: ROCKETCHAT_USER_ID
+    description: Rocket.Chat user ID for token authentication
+    prompt: User ID
+    password: false
+  - name: ROCKETCHAT_ACCESS_TOKEN
+    description: Rocket.Chat access token for token authentication
+    prompt: Access token
+    password: true
+  - name: ROCKETCHAT_USERNAME
+    description: Rocket.Chat username for password authentication
+    prompt: Username
+    password: false
+  - name: ROCKETCHAT_PASSWORD
+    description: Rocket.Chat password for password authentication
+    prompt: Password
+    password: true
+  - name: ROCKETCHAT_TRANSPORT
+    description: polling or websocket
+    prompt: Transport
+    password: false
+  - name: ROCKETCHAT_MENTION_NAMES
+    description: Comma-separated aliases that trigger the bot in rooms
+    prompt: Mention aliases
+    password: false
+  - name: ROCKETCHAT_ALLOWED_USERS
+    description: Comma-separated Rocket.Chat user IDs allowed to talk to Hermes
+    prompt: Allowed users
+    password: false
+  - name: ROCKETCHAT_ALLOW_ALL_USERS
+    description: Allow all Rocket.Chat users
+    prompt: Allow all users
+    password: false
+  - name: ROCKETCHAT_HOME_CHANNEL
+    description: Default room ID for cron and proactive delivery
+    prompt: Home room ID
+    password: false
