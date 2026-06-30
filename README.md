@@ -3,6 +3,8 @@
 A self-contained Hermes Agent platform plugin that connects Rocket.Chat rooms
 to the Hermes messaging gateway.
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 ## What it does
 
 - **Inbound:** Listens to Rocket.Chat DMs and channel mentions via REST polling
