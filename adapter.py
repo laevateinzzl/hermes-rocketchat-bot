@@ -136,3 +136,67 @@ def env_enablement() -> dict[str, Any] | None:
         seed["allowed_users"] = cfg.allowed_users
 
     return seed
+
+
+# ---------------------------------------------------------------------------
+# Mention gating
+# ---------------------------------------------------------------------------
+
+
+def should_handle_message(
+    room_type: str,
+    text: str,
+    mentions: list[str],
+    bot_user_id: str,
+    bot_username: str,
+    mention_names: list[str] | None = None,
+) -> bool:
+    """Decide whether an inbound Rocket.Chat message should be dispatched to Hermes.
+
+    - Direct messages always pass through.
+    - Group/channel messages require an explicit mention of the bot username
+      or a configured alias, either via Rocket.Chat mention metadata or via
+      an @-mention in the message text.
+    """
+    if mention_names is None:
+        mention_names = []
+
+    # DMs always pass through
+    if room_type == "direct":
+        return True
+
+    # Build the set of trigger names: bot username + configured aliases
+    triggers: set[str] = set()
+    if bot_username:
+        triggers.add(bot_username.lower())
+    for alias in mention_names:
+        if alias:
+            triggers.add(alias.lower())
+
+    if not triggers:
+        return False
+
+    # Check Rocket.Chat mention metadata (array of usernames)
+    for m in mentions:
+        if m.strip().lower() in triggers:
+            return True
+
+    # Check text for @mention patterns
+    text_lower = text.lower()
+    for trigger in triggers:
+        if _has_token_mention(text_lower, trigger):
+            return True
+
+    return False
+
+
+def _has_token_mention(text_lower: str, token: str) -> bool:
+    """Check if text contains @token as a whole-word mention.
+
+    A mention is a contiguous token preceded by @ and bounded by whitespace,
+    punctuation, or string boundaries.
+    """
+    import re
+
+    pattern = r"(?<![\w])@" + re.escape(token) + r"(?![\w])"
+    return bool(re.search(pattern, text_lower))
