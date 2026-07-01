@@ -1,8 +1,6 @@
 """Tests for register(ctx) — the Hermes plugin entry point."""
 
-import pytest
-
-from adapter import register
+from adapter import RocketChatAdapter, check_requirements, register
 
 
 class FakeContext:
@@ -76,6 +74,18 @@ def test_register_standalone_sender_fn_is_callable():
 
     fn = ctx.platforms[0]["standalone_sender_fn"]
     assert callable(fn)
+
+
+def test_check_requirements_returns_bool():
+    """Hermes platform_registry expects check_fn() to return a plain bool."""
+    assert isinstance(check_requirements(), bool)
+
+
+def test_adapter_initializes_platform_identity_in_isolated_tests():
+    """The local stub should preserve the same platform identity Hermes uses."""
+    adapter = RocketChatAdapter({})
+
+    assert getattr(adapter, "platform", None) == "rocketchat"
 
 
 def test_register_includes_platform_metadata():

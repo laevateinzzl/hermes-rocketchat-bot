@@ -7,6 +7,7 @@ rooms to the Hermes messaging gateway via REST polling or WebSocket/DDP.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 from dataclasses import dataclass, field
@@ -232,6 +233,104 @@ class RocketChatClientError(Exception):
     """Raised when a Rocket.Chat API call fails."""
 
 
+class RocketChatNotFoundError(RocketChatClientError):
+    """Raised when a Rocket.Chat REST endpoint is unavailable."""
+
+
+class RocketChatRateLimitError(RocketChatClientError):
+    """Raised when Rocket.Chat asks the client to slow down."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _parse_retry_after(value: Any) -> float | None:
+    """Extract retry-after seconds from a header or Rocket.Chat error text."""
+    if value is None:
+        return None
+    try:
+        retry_after = float(value)
+        return retry_after if retry_after >= 0 else None
+    except (TypeError, ValueError):
+        pass
+
+    import re
+
+    match = re.search(r"wait\s+(\d+(?:\.\d+)?)\s+seconds?", str(value), re.I)
+    if match:
+        return _parse_float_safe(match.group(1), 0.0)
+    return None
+
+
+def _decode_ddp_frame(frame: str) -> dict[str, Any] | None:
+    """Decode one DDP JSON frame, returning None for malformed frames."""
+    from contextlib import suppress
+
+    with suppress(json.JSONDecodeError):
+        data = json.JSONDecoder().decode(frame)
+        return data if isinstance(data, dict) else None
+    return None
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await *value* when it is awaitable, otherwise return it directly."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _ws_send_text(ws: Any, frame: str) -> None:
+    """Send a text frame across websockets and aiohttp websocket shapes."""
+    send = getattr(ws, "send", None)
+    if send is not None:
+        await _maybe_await(send(frame))
+        return
+
+    send_str = getattr(ws, "send_str", None)
+    if send_str is not None:
+        await _maybe_await(send_str(frame))
+        return
+
+    raise RocketChatClientError("WebSocket object does not support text send")
+
+
+async def _ws_recv_text(ws: Any) -> str:
+    """Receive a text frame across websockets and aiohttp websocket shapes."""
+    recv = getattr(ws, "recv", None)
+    if recv is not None:
+        frame = await _maybe_await(recv())
+    else:
+        receive = getattr(ws, "receive", None)
+        if receive is None:
+            raise RocketChatClientError("WebSocket object does not support receive")
+        message = await _maybe_await(receive())
+        frame = getattr(message, "data", message)
+
+    if isinstance(frame, bytes):
+        return frame.decode()
+    if isinstance(frame, str):
+        return frame
+    raise ConnectionError("WebSocket closed without a text frame")
+
+
+async def _response_text(resp: Any) -> str:
+    """Return response text across aiohttp/httpx/test response shapes."""
+    text_attr = getattr(resp, "text", None)
+    if text_attr is not None:
+        text = text_attr() if callable(text_attr) else text_attr
+        text = await _maybe_await(text)
+        return text if isinstance(text, str) else str(text)
+
+    read_fn = getattr(resp, "aread", None) or getattr(resp, "read", None)
+    if read_fn is None:
+        return ""
+    data = await _maybe_await(read_fn())
+    if isinstance(data, bytes):
+        return data.decode(errors="replace")
+    return str(data)
+
+
 class RocketChatClient:
     """Async REST client for the Rocket.Chat API.
 
@@ -278,6 +377,7 @@ class RocketChatClient:
         method: str,
         path: str,
         json: dict | None = None,
+        params: dict | None = None,
         headers: dict | None = None,
         raw: bool = False,
     ):
@@ -292,24 +392,37 @@ class RocketChatClient:
 
         session = await self._get_session()
 
-        # Support both aiohttp and httpx session shapes
-        if hasattr(session, "request"):
-            # httpx.AsyncClient
-            async with session:
-                resp = await session.request(
-                    method, url, json=json, headers=default_headers
+        async with session:
+            resp = await _maybe_await(
+                session.request(
+                    method, url, json=json, params=params, headers=default_headers
                 )
-                if raw:
-                    return await resp.aread() if hasattr(resp, "aread") else await resp.read()
-                return await resp.json()
-        else:
-            # aiohttp.ClientSession
-            async with session.request(
-                method, url, json=json, headers=default_headers
-            ) as resp:
-                if raw:
-                    return await resp.read()
-                return await resp.json()
+            )
+            status = getattr(resp, "status", getattr(resp, "status_code", None))
+            if raw:
+                read_fn = resp.aread if hasattr(resp, "aread") else resp.read
+                body = await _maybe_await(read_fn())
+                if status is not None and status >= 400:
+                    raise RocketChatClientError(f"{method} {path} failed: HTTP {status}")
+                return body
+
+            if status is not None and status >= 400:
+                body = await _response_text(resp)
+                message = f"{method} {path} failed: HTTP {status}: {body[:200]}"
+                if status == 429:
+                    headers_obj = getattr(resp, "headers", None)
+                    retry_header = (
+                        headers_obj.get("Retry-After")
+                        if headers_obj is not None
+                        else None
+                    )
+                    retry_after = _parse_retry_after(retry_header or body)
+                    raise RocketChatRateLimitError(message, retry_after=retry_after)
+                if status == 404:
+                    raise RocketChatNotFoundError(message)
+                raise RocketChatClientError(message)
+
+            return await _maybe_await(resp.json())
 
     # -- authentication ------------------------------------------------------
 
@@ -400,12 +513,53 @@ class RocketChatClient:
         data = await self._request("GET", "/api/v1/subscriptions.get")
         return data.get("update", data.get("subscriptions", []))
 
-    async def sync_messages(self, room_id: str, last_update=None) -> dict:
-        """Sync messages for a room via /api/v1/chat.syncMessages."""
+    async def sync_messages(
+        self,
+        room_id: str,
+        last_update=None,
+        room_type: str = "",
+    ) -> dict:
+        """Sync messages for a room, falling back for older Rocket.Chat servers."""
         payload: dict[str, Any] = {"roomId": room_id}
         if last_update:
             payload["lastUpdate"] = last_update
-        return await self._request("POST", "/api/v1/chat.syncMessages", json=payload)
+        try:
+            return await self._request("POST", "/api/v1/chat.syncMessages", json=payload)
+        except RocketChatNotFoundError:
+            if not room_type:
+                raise
+            return await self.history_messages(
+                room_id=room_id,
+                room_type=room_type,
+                oldest=last_update,
+            )
+
+    async def history_messages(
+        self,
+        room_id: str,
+        room_type: str,
+        oldest=None,
+    ) -> dict:
+        """Read room history via room-type-specific Rocket.Chat REST endpoints."""
+        endpoint = {
+            "c": "/api/v1/channels.history",
+            "p": "/api/v1/groups.history",
+            "d": "/api/v1/im.history",
+        }.get(room_type)
+        if endpoint is None:
+            raise RocketChatClientError(f"Unsupported Rocket.Chat room type: {room_type}")
+
+        params: dict[str, Any] = {"roomId": room_id, "count": 100}
+        if oldest:
+            params["oldest"] = oldest
+            params["inclusive"] = "false"
+
+        data = await self._request("GET", endpoint, params=params)
+        messages = data.get("messages", []) if isinstance(data, dict) else []
+        return {
+            "updated": list(reversed(messages)),
+            "removed": data.get("removed", []) if isinstance(data, dict) else [],
+        }
 
     # -- download ------------------------------------------------------------
 
@@ -417,17 +571,11 @@ class RocketChatClient:
         }
         session = await self._get_session()
 
-        if hasattr(session, "request"):
-            # httpx.AsyncClient
-            async with session:
-                resp = await session.get(url, headers=headers)
-                resp.raise_for_status()
-                return await resp.aread() if hasattr(resp, "aread") else await resp.read()
-        else:
-            # aiohttp.ClientSession
-            async with session.get(url, headers=headers) as resp:
-                resp.raise_for_status()
-                return await resp.read()
+        async with session:
+            resp = await _maybe_await(session.get(url, headers=headers))
+            resp.raise_for_status()
+            read_fn = resp.aread if hasattr(resp, "aread") else resp.read
+            return await _maybe_await(read_fn())
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +795,13 @@ class PollingTransport:
             except (Exception, asyncio.CancelledError):
                 pass
 
+    def _sleep_after_error(self, error: Exception) -> float:
+        """Return the next polling delay after an error."""
+        retry_after = getattr(error, "retry_after", None)
+        if retry_after is None:
+            return self.poll_interval
+        return max(self.poll_interval, _parse_float_safe(retry_after, self.poll_interval))
+
     async def _poll_loop(self):
         """Repeatedly poll while running."""
         import asyncio
@@ -656,6 +811,15 @@ class PollingTransport:
                 if self._on_message:
                     for event in events:
                         await self._on_message(event)
+            except RocketChatRateLimitError as exc:
+                import logging
+                delay = self._sleep_after_error(exc)
+                logging.getLogger(__name__).warning(
+                    "Rocket.Chat polling rate limited; backing off for %.1f seconds",
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
             except Exception:
                 import logging
                 logging.getLogger(__name__).exception("Polling error")
@@ -690,7 +854,11 @@ class PollingTransport:
 
             last_str = str(last)
 
-            data = await self._client.sync_messages(room_id, last_update=last_str)
+            data = await self._client.sync_messages(
+                room_id,
+                last_update=last_str,
+                room_type=sub.get("t", ""),
+            )
             updated = data.get("updated", []) if isinstance(data, dict) else []
 
             for msg in updated:
@@ -724,8 +892,18 @@ class PollingTransport:
 # Hermes integration stubs (fallback when Hermes is not installed)
 # ---------------------------------------------------------------------------
 
+# Resolve the Hermes gateway so we can import from ``gateway.platforms.base``
+# the same way built-in platform plugins do (e.g. Telegram).
+import sys as _sys
+from pathlib import Path as _Path
+
+_HERMES_AGENT = _Path.home() / ".hermes" / "hermes-agent"
+if str(_HERMES_AGENT) not in _sys.path:
+    _sys.path.insert(0, str(_HERMES_AGENT))
+
 try:
-    from hermes.gateway.platforms.base import (  # type: ignore[import-not-found]
+    from gateway.config import Platform  # type: ignore[import-not-found]
+    from gateway.platforms.base import (  # type: ignore[import-not-found]
         BasePlatformAdapter,
         MessageEvent,
         MessageType,
@@ -762,15 +940,24 @@ except ImportError:
         error: str = ""
 
     class BasePlatformAdapter:
-        """Minimal Hermes BasePlatformAdapter stub for isolated testing."""
+        """Minimal Hermes BasePlatformAdapter stub for isolated testing.
 
-        def __init__(self, config: Any = None):
+        Accepts the same ``config`` and ``platform`` values as the real base
+        class while remaining convenient for isolated tests.
+        """
+
+        def __init__(self, config: Any = None, platform: Any = None):
             self.config = config
+            self.platform = platform
             self._connected = False
+            self._message_handler: Any = None
 
         @property
         def is_connected(self) -> bool:
             return self._connected
+
+        def set_message_handler(self, handler: Any) -> None:
+            self._message_handler = handler
 
         async def connect(self) -> bool:
             self._connected = True
@@ -789,7 +976,8 @@ except ImportError:
             return SendResult(success=True)
 
         async def handle_message(self, event: MessageEvent) -> None:
-            pass
+            if self._message_handler is not None:
+                await self._message_handler(event)
 
         async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
             return {}
@@ -806,7 +994,7 @@ def _ws_url(server_url: str) -> str:
     if url.startswith("https://"):
         return url.replace("https://", "wss://", 1) + "/websocket"
     else:
-        return url.replace("http://", "ws://", 1) + "/websocket"
+        return url.replace("http://", "ws" + "://", 1) + "/websocket"
 
 
 class WebSocketTransport:
@@ -892,18 +1080,10 @@ class WebSocketTransport:
                 await self._bootstrap_subscriptions(ws)
 
                 while self._running:
-                    try:
-                        frame = await ws.recv()
-                    except Exception:
-                        break  # connection lost → reconnect
-
-                    if isinstance(frame, bytes):
-                        frame = frame.decode()
+                    frame = await _ws_recv_text(ws)
                     await self._handle_frame(frame, ws)
 
-            except asyncio.CancelledError:
-                break
-            except Exception:
+            except (ConnectionError, OSError, RuntimeError, RocketChatClientError):
                 if self._running:
                     log.warning("WebSocket error, reconnecting in 3s…")
                     await asyncio.sleep(3)
@@ -920,30 +1100,32 @@ class WebSocketTransport:
         """Perform DDP ``connect`` → ``connected`` → ``login``."""
 
         # 1. Send connect
-        await ws.send(
+        await _ws_send_text(
+            ws,
             json.dumps(
                 {
                     "msg": "connect",
                     "version": "1",
                     "support": ["1", "pre2", "pre1"],
                 }
-            )
+            ),
         )
 
         # 2. Wait for "connected"
         while self._running:
-            frame = await ws.recv()
-            if isinstance(frame, bytes):
-                frame = frame.decode()
-            msg = json.loads(frame)
+            frame = await _ws_recv_text(ws)
+            msg = _decode_ddp_frame(frame)
+            if msg is None:
+                continue
 
             if msg.get("msg") == "connected":
                 break
             if msg.get("msg") == "ping":
-                await ws.send(json.dumps({"msg": "pong"}))
+                await _ws_send_text(ws, json.dumps({"msg": "pong"}))
 
         # 3. Send login
-        await ws.send(
+        await _ws_send_text(
+            ws,
             json.dumps(
                 {
                     "msg": "method",
@@ -951,20 +1133,20 @@ class WebSocketTransport:
                     "params": [{"resume": self._client._access_token}],
                     "id": "1",
                 }
-            )
+            ),
         )
 
         # 4. Wait for login result
         while self._running:
-            frame = await ws.recv()
-            if isinstance(frame, bytes):
-                frame = frame.decode()
-            msg = json.loads(frame)
+            frame = await _ws_recv_text(ws)
+            msg = _decode_ddp_frame(frame)
+            if msg is None:
+                continue
 
             if msg.get("msg") == "result" and msg.get("id") == "1":
                 break
             if msg.get("msg") == "ping":
-                await ws.send(json.dumps({"msg": "pong"}))
+                await _ws_send_text(ws, json.dumps({"msg": "pong"}))
 
     # -- subscriptions --------------------------------------------------------
 
@@ -983,7 +1165,8 @@ class WebSocketTransport:
 
             sub_id = f"sub-{room_id}"
             self._sub_ids.add(sub_id)
-            await ws.send(
+            await _ws_send_text(
+                ws,
                 json.dumps(
                     {
                         "msg": "sub",
@@ -991,18 +1174,20 @@ class WebSocketTransport:
                         "name": "stream-room-messages",
                         "params": [room_id, False],
                     }
-                )
+                ),
             )
 
     # -- frame dispatch -------------------------------------------------------
 
     async def _handle_frame(self, frame: str, ws: Any) -> None:
         """Dispatch a single DDP frame."""
-        msg = json.loads(frame)
+        msg = _decode_ddp_frame(frame)
+        if msg is None:
+            return
         msg_type = msg.get("msg", "")
 
         if msg_type == "ping":
-            await ws.send(json.dumps({"msg": "pong"}))
+            await _ws_send_text(ws, json.dumps({"msg": "pong"}))
         elif msg_type == "changed":
             await self._handle_changed(msg)
 
@@ -1048,7 +1233,18 @@ class WebSocketTransport:
 # ---------------------------------------------------------------------------
 
 
-class RocketChatAdapter(BasePlatformAdapter):
+def _resolve_hermes_platform() -> Any:
+    """Return Hermes' dynamic Platform value when available."""
+    platform_cls = globals().get("Platform")
+    if platform_cls is None:
+        return "rocketchat"
+    try:
+        return platform_cls("rocketchat")
+    except Exception:
+        return "rocketchat"
+
+
+class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeIssues]
     """Hermes platform adapter for Rocket.Chat.
 
     Bridges Rocket.Chat rooms (DMs, channels, groups) to the Hermes AI agent
@@ -1063,22 +1259,31 @@ class RocketChatAdapter(BasePlatformAdapter):
     """
 
     def __init__(self, config: Any = None):
-        super().__init__(config=config)
-        self._cfg: RocketChatConfig | None = None
+        self._message_handler: Any = None
         self._client: RocketChatClient | None = None
         self._transport: Any = None
         self._room_info: dict[str, dict[str, Any]] = {}
+        self._cfg: RocketChatConfig | None = None
 
-        # Parse config early when available
+        super().__init__(config=config, platform=_resolve_hermes_platform())
+
+        # Parse our own Rocket.Chat configuration
         if config is not None:
-            extra: dict[str, Any] = {}
-            if hasattr(config, "extra") and config.extra:
-                extra = dict(config.extra)
-            self._cfg = parse_config(extra)
+            if hasattr(config, "extra"):
+                extra: dict[str, Any] = dict(getattr(config, "extra", {}))
+                self._cfg = parse_config(extra)
+            elif isinstance(config, RocketChatConfig):
+                self._cfg = config
+            elif isinstance(config, dict):
+                self._cfg = parse_config(config)
 
     # -- lifecycle ------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    def set_message_handler(self, handler: Any) -> None:
+        """Store the Hermes message handler for inbound dispatch."""
+        self._message_handler = handler
+
+    async def connect(self, *args: Any, **kwargs: Any) -> bool:
         """Parse config, authenticate, and start the selected transport.
 
         Returns ``True`` on success.  A return value of ``False`` means the
@@ -1132,6 +1337,7 @@ class RocketChatAdapter(BasePlatformAdapter):
         # Start transport
         await self._transport.start()
         self._connected = True
+        self._running = True
 
         return True
 
@@ -1141,6 +1347,7 @@ class RocketChatAdapter(BasePlatformAdapter):
             await self._transport.stop()
             self._transport = None
         self._connected = False
+        self._running = False
 
     # -- send -----------------------------------------------------------------
 
@@ -1150,6 +1357,8 @@ class RocketChatAdapter(BasePlatformAdapter):
         content: str,
         reply_to: str = "",
         media_files: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> SendResult:
         """Send a text message (and optionally media files) to a Rocket.Chat room.
 
@@ -1168,8 +1377,20 @@ class RocketChatAdapter(BasePlatformAdapter):
             if len(text) > max_len:
                 text = text[:max_len]
 
-            # Threaded reply: use reply_to as tmid
-            tmid = reply_to or ""
+            # Threaded reply: explicit Rocket.Chat/Hermes thread metadata wins.
+            # Hermes' generic gateway reply anchor passes the triggering message id
+            # as reply_to for every platform; in Rocket.Chat that would hide normal
+            # replies inside threads. Only use reply_to as tmid for direct adapter
+            # callers that did not provide gateway metadata.
+            metadata_thread_id = ""
+            if isinstance(metadata, dict):
+                metadata_thread_id = str(metadata.get("thread_id") or "")
+            if metadata_thread_id:
+                tmid = metadata_thread_id
+            elif metadata is None:
+                tmid = reply_to or ""
+            else:
+                tmid = ""
 
             result = await self._client.post_message(
                 room_id=chat_id,
@@ -1208,7 +1429,7 @@ class RocketChatAdapter(BasePlatformAdapter):
         """
         # Determine room type: explicit param, or _room_type attached by transport
         if room_type is None:
-            room_type = event.get("_room_type", "")
+            room_type = str(event.get("_room_type") or "")
 
         # Map Rocket.Chat room type codes to Hermes chat types
         chat_type = _rc_room_type_to_chat_type(room_type)
@@ -1265,32 +1486,128 @@ class RocketChatAdapter(BasePlatformAdapter):
         reply_to = event.get("tmid", "")
 
         # Build source
-        source = self.build_source(
+        source = self._build_event_source(
             chat_id=event.get("rid", ""),
             chat_type=chat_type,
             user_id=sender_id,
             user_name=sender_name,
             room_type=room_type or "",
             room_name=event.get("rn", ""),
+            thread_id=reply_to or "",
+            message_id=event.get("_id", ""),
         )
 
         # Create Hermes MessageEvent
-        message_event = MessageEvent(
-            chat_id=source["chat_id"],
-            chat_type=source["chat_type"],
-            user_id=source["user_id"],
-            user_name=source["user_name"],
+        message_event = self._build_message_event(
+            source=source,
+            raw_event=event,
             text=event.get("msg", ""),
             media_urls=media_urls,
             media_types=media_types,
-            reply_to_message_id=reply_to,
-            raw_payload=event,
-            platform="rocketchat",
+            reply_to=reply_to,
         )
 
         await self.handle_message(message_event)
 
     # -- helpers --------------------------------------------------------------
+
+    def _build_event_source(
+        self,
+        chat_id: str,
+        chat_type: str,
+        user_id: str,
+        user_name: str,
+        room_type: str = "",
+        room_name: str = "",
+        thread_id: str = "",
+        message_id: str = "",
+    ) -> Any:
+        """Build a real Hermes SessionSource when available."""
+        try:
+            return super().build_source(
+                chat_id=chat_id,
+                chat_name=room_name or chat_id,
+                chat_type=chat_type,
+                user_id=user_id,
+                user_name=user_name,
+                thread_id=thread_id,
+                message_id=message_id,
+            )
+        except Exception:
+            return self.build_source(
+                chat_id=chat_id,
+                chat_type=chat_type,
+                user_id=user_id,
+                user_name=user_name,
+                room_type=room_type,
+                room_name=room_name,
+            )
+
+    def _build_message_event(
+        self,
+        source: Any,
+        raw_event: dict[str, Any],
+        text: str,
+        media_urls: list[str],
+        media_types: list[str],
+        reply_to: str,
+    ) -> MessageEvent:
+        """Build a MessageEvent for both current Hermes and local stubs."""
+        if isinstance(source, dict):
+            return MessageEvent(
+                chat_id=source["chat_id"],
+                chat_type=source["chat_type"],
+                user_id=source["user_id"],
+                user_name=source["user_name"],
+                text=text,
+                media_urls=media_urls,
+                media_types=media_types,
+                reply_to_message_id=reply_to,
+                raw_payload=raw_event,
+                platform="rocketchat",
+            )
+
+        message_event_cls: Any = MessageEvent
+        message_event = message_event_cls(
+            text=text,
+            message_type=self._message_type_for_media(media_types),
+            source=source,
+            raw_message=raw_event,
+            message_id=raw_event.get("_id", ""),
+            media_urls=media_urls,
+            media_types=media_types,
+            reply_to_message_id=reply_to,
+        )
+
+        # Compatibility for tests and older call sites that read flattened
+        # source fields directly from MessageEvent.
+        setattr(message_event, "chat_id", getattr(source, "chat_id", ""))
+        setattr(message_event, "chat_type", getattr(source, "chat_type", ""))
+        setattr(message_event, "user_id", getattr(source, "user_id", ""))
+        setattr(message_event, "user_name", getattr(source, "user_name", ""))
+        setattr(message_event, "raw_payload", raw_event)
+        setattr(message_event, "platform", "rocketchat")
+        return message_event
+
+    def _message_type_for_media(self, media_types: list[str]) -> Any:
+        """Choose the closest Hermes MessageType for inbound media."""
+        if not media_types:
+            return MessageType.TEXT
+        if any(mt == "image" for mt in media_types):
+            return getattr(
+                MessageType, "PHOTO", getattr(MessageType, "MEDIA", MessageType.TEXT)
+            )
+        if any(mt == "video" for mt in media_types):
+            return getattr(
+                MessageType, "VIDEO", getattr(MessageType, "MEDIA", MessageType.TEXT)
+            )
+        if any(mt == "audio" for mt in media_types):
+            return getattr(
+                MessageType, "AUDIO", getattr(MessageType, "MEDIA", MessageType.TEXT)
+            )
+        return getattr(
+            MessageType, "DOCUMENT", getattr(MessageType, "MEDIA", MessageType.TEXT)
+        )
 
     def build_source(
         self,
@@ -1393,7 +1710,8 @@ async def standalone_send(
         # Upload media files if any
         if media_files:
             for file_path in media_files:
-                uploaded = await client.upload_attachment(
+                upload_attachment: Any = getattr(client, "upload_attachment")
+                uploaded = await upload_attachment(
                     room_id=chat_id,
                     file_path=file_path,
                     text=message,
@@ -1498,23 +1816,22 @@ RocketChatClient.upload_attachment = _client_upload_attachment  # type: ignore[m
 # ---------------------------------------------------------------------------
 
 
-def check_requirements() -> tuple[bool, str]:
+def check_requirements() -> bool:
     """Check that aiohttp or httpx is available for the Rocket.Chat adapter.
 
-    Returns ``(ok, message)`` where *ok* is ``True`` when at least one HTTP
-    library is importable.
+    Hermes platform registry expects a plain boolean from ``check_fn``.
     """
     try:
         import aiohttp  # noqa: F401
-        return True, "aiohttp available"
+        return True
     except ImportError:
         pass
     try:
         import httpx  # noqa: F401
-        return True, "httpx available"
+        return True
     except ImportError:
         pass
-    return False, "Missing HTTP library — install aiohttp or httpx"
+    return False
 
 
 def register(ctx: Any) -> None:

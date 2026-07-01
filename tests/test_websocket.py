@@ -3,7 +3,7 @@
 import asyncio
 import json
 
-import pytest
+import pytest  # type: ignore[reportMissingImports]
 
 from adapter import WebSocketTransport, _ws_url
 
@@ -41,6 +41,36 @@ class FakeWebSocket:
         return self._closed
 
 
+class FakeAiohttpMessage:
+    """Minimal aiohttp WSMessage shape for receive()."""
+
+    def __init__(self, data: str):
+        self.data = data
+
+
+class FakeAiohttpWebSocket:
+    """Simulates aiohttp.ClientWebSocketResponse's send/receive API."""
+
+    def __init__(self, server_frames=None):
+        self.sent_frames: list[str] = []
+        self._server_frames: list[str] = list(server_frames or [])
+        self._closed = False
+        self._recv_index = 0
+
+    async def send_str(self, data: str):
+        self.sent_frames.append(data)
+
+    async def receive(self):
+        if self._recv_index < len(self._server_frames):
+            frame = self._server_frames[self._recv_index]
+            self._recv_index += 1
+            return FakeAiohttpMessage(frame)
+        raise ConnectionError("connection closed")
+
+    async def close(self):
+        self._closed = True
+
+
 # ---------------------------------------------------------------------------
 # Fake client for WebSocket tests
 # ---------------------------------------------------------------------------
@@ -64,6 +94,10 @@ class FakeWSClient:
 # ---------------------------------------------------------------------------
 # DDP frame helpers
 # ---------------------------------------------------------------------------
+
+
+def _decode_frame(frame: str) -> dict:
+    return json.JSONDecoder().decode(frame)
 
 
 def _connected_frame(session="test-session-1"):
@@ -170,9 +204,33 @@ async def test_websocket_sends_connect_on_open():
 
     # Should have sent a connect frame
     assert len(ws.sent_frames) >= 1
-    connect_msg = json.loads(ws.sent_frames[0])
+    connect_msg = _decode_frame(ws.sent_frames[0])
     assert connect_msg["msg"] == "connect"
     assert connect_msg["version"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_websocket_supports_aiohttp_websocket_api():
+    """Default aiohttp websockets use send_str()/receive(), not send()/recv()."""
+    ws = FakeAiohttpWebSocket(
+        server_frames=[
+            _connected_frame(),
+            _login_result(),
+        ]
+    )
+    client = FakeWSClient()
+
+    transport = WebSocketTransport(
+        client=client,
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=_factory(ws),
+    )
+
+    await _run_and_stop(transport)
+
+    assert len(ws.sent_frames) >= 2
+    assert _decode_frame(ws.sent_frames[0])["msg"] == "connect"
+    assert _decode_frame(ws.sent_frames[1])["method"] == "login"
 
 
 @pytest.mark.asyncio
@@ -196,7 +254,7 @@ async def test_websocket_sends_login_after_connected():
 
     # Second frame should be login
     assert len(ws.sent_frames) >= 2
-    login_msg = json.loads(ws.sent_frames[1])
+    login_msg = _decode_frame(ws.sent_frames[1])
     assert login_msg["msg"] == "method"
     assert login_msg["method"] == "login"
 
@@ -223,7 +281,7 @@ async def test_websocket_pong_on_ping():
     await _run_and_stop(transport, sleep_s=0.1)
 
     # Check that at least one frame is a pong
-    pongs = [f for f in ws.sent_frames if json.loads(f)["msg"] == "pong"]
+    pongs = [f for f in ws.sent_frames if _decode_frame(f)["msg"] == "pong"]
     assert len(pongs) >= 1
 
 
@@ -257,7 +315,7 @@ async def test_websocket_subscribes_to_rooms_after_login():
     await _run_and_stop(transport)
 
     # Should have subscribed to room streams
-    sub_frames = [json.loads(f) for f in ws.sent_frames if json.loads(f).get("msg") == "sub"]
+    sub_frames = [_decode_frame(f) for f in ws.sent_frames if _decode_frame(f).get("msg") == "sub"]
     assert len(sub_frames) >= 1
     # Each sub should target stream-room-messages
     for sf in sub_frames:

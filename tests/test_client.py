@@ -2,7 +2,12 @@
 
 import pytest
 
-from adapter import RocketChatClient, RocketChatClientError, RocketChatIdentity
+from adapter import (
+    RocketChatClient,
+    RocketChatClientError,
+    RocketChatIdentity,
+    RocketChatRateLimitError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +141,6 @@ async def test_password_auth_calls_login_endpoint():
         username="hermesbot",
         password="secret",
     )
-    client._session = session
     # override _get_session to return our fake
     async def _get_session():
         return session
@@ -169,8 +173,9 @@ async def test_auth_failure_raises_error():
         user_id="bad-id",
         access_token="bad-token",
     )
-    client._session = session
-    client._get_session = lambda: session  # type: ignore[method-assign]
+    async def _get_session():
+        return session
+    client._get_session = _get_session  # type: ignore[method-assign]
 
     with pytest.raises(RocketChatClientError):
         await client.initialize()
@@ -239,6 +244,80 @@ async def test_post_message_without_tmid():
 
     req = session.requests[1]
     assert "tmid" not in req["json"]
+
+
+# ---------------------------------------------------------------------------
+# Rate limit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_response_raises_retry_after_error():
+    """Rocket.Chat 429 errors should expose retry-after seconds for polling."""
+    session = FakeSession(
+        responses=[
+            FakeResponse(
+                status=429,
+                json_data={
+                    "success": False,
+                    "error": "Error, too many requests. You must wait 27 seconds before trying again.",
+                },
+                text_data="Error, too many requests. You must wait 27 seconds before trying again.",
+            )
+        ]
+    )
+    client = FakeClient(session)
+
+    with pytest.raises(RocketChatRateLimitError) as exc_info:
+        await client.list_subscriptions()
+
+    assert exc_info.value.retry_after == 27
+
+
+# ---------------------------------------------------------------------------
+# Message sync tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sync_messages_falls_back_to_room_history_when_sync_endpoint_missing():
+    """Older Rocket.Chat servers can lack chat.syncMessages but support history."""
+    session = FakeSession(
+        responses=[
+            FakeResponse(status=404, text_data="404 Not Found"),
+            FakeResponse(
+                json_data={
+                    "success": True,
+                    "messages": [
+                        {"_id": "new-msg", "msg": "newer"},
+                        {"_id": "old-msg", "msg": "older"},
+                    ],
+                }
+            ),
+        ]
+    )
+    client = FakeClient(session)
+
+    data = await client.sync_messages(
+        "room-abc",
+        last_update="2026-07-01T01:30:00.000Z",
+        room_type="d",
+    )
+
+    assert [msg["_id"] for msg in data["updated"]] == ["old-msg", "new-msg"]
+    assert data["removed"] == []
+    sync_req = session.requests[0]
+    assert sync_req["method"] == "POST"
+    assert "/api/v1/chat.syncMessages" in sync_req["url"]
+    history_req = session.requests[1]
+    assert history_req["method"] == "GET"
+    assert "/api/v1/im.history" in history_req["url"]
+    assert history_req["params"] == {
+        "roomId": "room-abc",
+        "count": 100,
+        "oldest": "2026-07-01T01:30:00.000Z",
+        "inclusive": "false",
+    }
 
 
 # ---------------------------------------------------------------------------

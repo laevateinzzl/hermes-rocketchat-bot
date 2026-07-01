@@ -2,7 +2,7 @@
 
 import pytest
 
-from adapter import InMemoryCheckpointStore, PollingTransport
+from adapter import InMemoryCheckpointStore, PollingTransport, RocketChatRateLimitError
 
 
 # ---------------------------------------------------------------------------
@@ -54,8 +54,10 @@ class FakePollingClient:
         self.subscriptions_calls.append({"updated_since": updated_since})
         return self._subscriptions
 
-    async def sync_messages(self, room_id, last_update=None):
-        self.sync_calls.append({"room_id": room_id, "last_update": last_update})
+    async def sync_messages(self, room_id, last_update=None, room_type=None):
+        self.sync_calls.append(
+            {"room_id": room_id, "last_update": last_update, "room_type": room_type}
+        )
         key = room_id
         if callable(self._sync_messages):
             return self._sync_messages(room_id, last_update)
@@ -65,6 +67,14 @@ class FakePollingClient:
 # ---------------------------------------------------------------------------
 # PollOnce tests
 # ---------------------------------------------------------------------------
+
+
+def test_poll_error_backoff_uses_rate_limit_retry_after():
+    """Polling should respect Rocket.Chat's 429 wait time instead of hammering."""
+    transport = PollingTransport(FakePollingClient(), poll_interval=3)
+    error = RocketChatRateLimitError("rate limited", retry_after=27)
+
+    assert transport._sleep_after_error(error) == 27
 
 
 @pytest.mark.asyncio
@@ -226,6 +236,34 @@ async def test_poll_deduplicates_seen_ids():
 
     events = await transport.poll_once()
     assert len(events) == 0
+
+
+@pytest.mark.asyncio
+async def test_poll_passes_room_type_to_sync_messages():
+    """The REST client needs room type to choose history fallback endpoints."""
+    client = FakePollingClient(
+        subscriptions=[
+            {
+                "_id": "room1",
+                "rid": "room1",
+                "t": "p",
+                "name": "private-room",
+                "_updatedAt": "2024-01-01T00:02:00.000Z",
+            }
+        ],
+        sync_messages={"room1": {"updated": [], "removed": []}},
+    )
+
+    transport = PollingTransport(client)
+    transport.checkpoint_store.save("room1", "2023-01-01T00:00:00.000Z")
+
+    await transport.poll_once()
+
+    assert client.sync_calls[0] == {
+        "room_id": "room1",
+        "last_update": "2023-01-01T00:00:00.000Z",
+        "room_type": "p",
+    }
 
 
 @pytest.mark.asyncio

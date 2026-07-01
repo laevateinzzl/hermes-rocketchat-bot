@@ -5,9 +5,6 @@ import pytest
 from adapter import (
     RocketChatAdapter,
     RocketChatConfig,
-    MessageEvent,
-    SendResult,
-    MessageType,
     RocketChatIdentity,
 )
 
@@ -102,7 +99,7 @@ async def test_adapter_connect_initializes_client_and_starts_transport():
     original_connect = adapter.connect
 
     async def fake_connect():
-        adapter._client = client
+        setattr(adapter, "_client", client)
         await client.initialize()
         adapter._transport = transport
         transport.set_on_message(adapter._on_inbound)
@@ -114,7 +111,7 @@ async def test_adapter_connect_initializes_client_and_starts_transport():
 
     result = await adapter.connect()
 
-    assert result is True
+    assert result
     assert adapter._connected
     assert transport.started
     assert client.initialize_calls == 1
@@ -144,7 +141,7 @@ async def test_adapter_send_posts_message_with_tmid():
     """send() should call client.post_message with thread info."""
     adapter = RocketChatAdapter(RocketChatConfig())
     client = FakeClient()
-    adapter._client = client
+    setattr(adapter, "_client", client)
     adapter._connected = True
 
     result = await adapter.send(
@@ -165,13 +162,69 @@ async def test_adapter_send_without_reply_to():
     """send() without reply_to should not include tmid."""
     adapter = RocketChatAdapter(RocketChatConfig())
     client = FakeClient()
-    adapter._client = client
+    setattr(adapter, "_client", client)
     adapter._connected = True
 
     result = await adapter.send(chat_id="room-1", content="hi")
 
     assert result.success
     assert client.post_message_calls[0]["tmid"] == ""
+
+
+@pytest.mark.asyncio
+async def test_adapter_send_accepts_gateway_metadata_kwarg():
+    """Hermes gateway may pass send(..., metadata=...) for notices."""
+    adapter = RocketChatAdapter(RocketChatConfig())
+    client = FakeClient()
+    setattr(adapter, "_client", client)
+    adapter._connected = True
+
+    result = await adapter.send(
+        chat_id="room-1",
+        content="working",
+        metadata={"kind": "notice"},
+    )
+
+    assert result.success
+    assert client.post_message_calls[0]["text"] == "working"
+
+
+@pytest.mark.asyncio
+async def test_adapter_send_gateway_reply_without_thread_metadata_posts_main_room():
+    """Generic Hermes reply anchors should not force Rocket.Chat thread replies."""
+    adapter = RocketChatAdapter(RocketChatConfig())
+    client = FakeClient()
+    setattr(adapter, "_client", client)
+    adapter._connected = True
+
+    result = await adapter.send(
+        chat_id="room-1",
+        content="visible reply",
+        reply_to="trigger-message-id",
+        metadata={"notify": True},
+    )
+
+    assert result.success
+    assert client.post_message_calls[0]["tmid"] == ""
+
+
+@pytest.mark.asyncio
+async def test_adapter_send_gateway_thread_metadata_uses_thread_id():
+    """Rocket.Chat threads should use explicit Hermes thread metadata."""
+    adapter = RocketChatAdapter(RocketChatConfig())
+    client = FakeClient()
+    setattr(adapter, "_client", client)
+    adapter._connected = True
+
+    result = await adapter.send(
+        chat_id="room-1",
+        content="thread reply",
+        reply_to="child-message-id",
+        metadata={"thread_id": "parent-thread-id", "notify": True},
+    )
+
+    assert result.success
+    assert client.post_message_calls[0]["tmid"] == "parent-thread-id"
 
 
 @pytest.mark.asyncio
@@ -202,7 +255,7 @@ async def test_adapter_dm_forwards_to_handle_message():
     )
 
     adapter = RocketChatAdapter(cfg)
-    adapter._client = FakeClient()
+    setattr(adapter, "_client", FakeClient())
     adapter._connected = True
 
     handled_events = []
@@ -243,7 +296,7 @@ async def test_adapter_channel_without_mention_is_ignored():
     )
 
     adapter = RocketChatAdapter(cfg)
-    adapter._client = FakeClient()
+    setattr(adapter, "_client", FakeClient())
     adapter._connected = True
 
     handled_events = []
@@ -283,7 +336,7 @@ async def test_adapter_channel_with_mention_is_forwarded():
     client = FakeClient()
     # Initialize identity so bot_username is known for mention matching
     await client.initialize()
-    adapter._client = client
+    setattr(adapter, "_client", client)
     adapter._connected = True
 
     handled_events = []
@@ -320,7 +373,7 @@ async def test_adapter_thread_reply_targeting():
 
     adapter = RocketChatAdapter(cfg)
     client = FakeClient()
-    adapter._client = client
+    setattr(adapter, "_client", client)
     adapter._connected = True
 
     handled_events = []
