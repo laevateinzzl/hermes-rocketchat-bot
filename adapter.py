@@ -237,6 +237,9 @@ class RocketChatNotFoundError(RocketChatClientError):
     """Raised when a Rocket.Chat REST endpoint is unavailable."""
 
 
+THINKING_PLACEHOLDER_TEXT = "💭 Thinking…"
+
+
 class RocketChatRateLimitError(RocketChatClientError):
     """Raised when Rocket.Chat asks the client to slow down."""
 
@@ -366,7 +369,7 @@ class RocketChatClient:
     async def _get_session(self):
         """Return an aiohttp ClientSession (lazy import to keep deps optional)."""
         try:
-            import aiohttp
+            import aiohttp  # type: ignore[reportMissingImports]
             return aiohttp.ClientSession()
         except ImportError:
             import httpx
@@ -502,6 +505,20 @@ class RocketChatClient:
         if not data.get("success", False):
             msg = data.get("error", "chat.postMessage failed")
             raise RocketChatClientError(f"Send failed: {msg}")
+
+        return data.get("message", {})
+
+    async def update_message(self, room_id: str, message_id: str, text: str) -> dict:
+        """Update an existing chat message via /api/v1/chat.update."""
+        data = await self._request(
+            "POST",
+            "/api/v1/chat.update",
+            json={"roomId": room_id, "msgId": message_id, "text": text},
+        )
+
+        if not data.get("success", False):
+            msg = data.get("error", "chat.update failed")
+            raise RocketChatClientError(f"Update failed: {msg}")
 
         return data.get("message", {})
 
@@ -1053,7 +1070,7 @@ class WebSocketTransport:
     async def _default_ws_factory(self) -> Any:
         """Create a real aiohttp WebSocket connection."""
         try:
-            import aiohttp
+            import aiohttp  # type: ignore[reportMissingImports]
 
             session = aiohttp.ClientSession()
             # Store the session so it can be closed later
@@ -1263,6 +1280,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         self._client: RocketChatClient | None = None
         self._transport: Any = None
         self._room_info: dict[str, dict[str, Any]] = {}
+        self._typing_placeholders: dict[str, str] = {}
         self._cfg: RocketChatConfig | None = None
 
         super().__init__(config=config, platform=_resolve_hermes_platform())
@@ -1351,6 +1369,58 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
 
     # -- send -----------------------------------------------------------------
 
+    def _metadata_thread_id(self, metadata: dict[str, Any] | None) -> str:
+        """Return the explicit Hermes/Rocket.Chat thread id from metadata."""
+        if isinstance(metadata, dict):
+            return str(metadata.get("thread_id") or "")
+        return ""
+
+    def _typing_placeholder_key(
+        self,
+        chat_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Build a stable placeholder key for a room or room thread."""
+        return f"{chat_id}\u0000{self._metadata_thread_id(metadata)}"
+
+    def _should_consume_typing_placeholder(
+        self,
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        """Return True when a send is the final user-visible reply."""
+        return isinstance(metadata, dict) and bool(metadata.get("notify"))
+
+    async def send_typing(
+        self,
+        chat_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Create one visible thinking placeholder for the active turn."""
+        if not self._connected or self._client is None:
+            return
+
+        key = self._typing_placeholder_key(chat_id, metadata)
+        if key in self._typing_placeholders:
+            return
+
+        result = await self._client.post_message(
+            room_id=chat_id,
+            text=THINKING_PLACEHOLDER_TEXT,
+            tmid=self._metadata_thread_id(metadata),
+        )
+        message_id = str(result.get("_id") or "")
+        if message_id:
+            self._typing_placeholders[key] = message_id
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Keep placeholders available for final send to edit.
+
+        Hermes calls stop_typing after the agent finishes but before the final
+        response is delivered, so clearing placeholder state here would prevent
+        the final send from replacing the thinking message.
+        """
+        return None
+
     async def send(
         self,
         chat_id: str,
@@ -1382,15 +1452,27 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             # as reply_to for every platform; in Rocket.Chat that would hide normal
             # replies inside threads. Only use reply_to as tmid for direct adapter
             # callers that did not provide gateway metadata.
-            metadata_thread_id = ""
-            if isinstance(metadata, dict):
-                metadata_thread_id = str(metadata.get("thread_id") or "")
+            metadata_thread_id = self._metadata_thread_id(metadata)
             if metadata_thread_id:
                 tmid = metadata_thread_id
             elif metadata is None:
                 tmid = reply_to or ""
             else:
                 tmid = ""
+
+            placeholder_key = self._typing_placeholder_key(chat_id, metadata)
+            placeholder_id = self._typing_placeholders.get(placeholder_key)
+            if placeholder_id and self._should_consume_typing_placeholder(metadata):
+                result = await self._client.update_message(
+                    room_id=chat_id,
+                    message_id=placeholder_id,
+                    text=text,
+                )
+                self._typing_placeholders.pop(placeholder_key, None)
+                return SendResult(
+                    success=True,
+                    message_id=result.get("_id", placeholder_id),
+                )
 
             result = await self._client.post_message(
                 room_id=chat_id,
@@ -1822,7 +1904,7 @@ def check_requirements() -> bool:
     Hermes platform registry expects a plain boolean from ``check_fn``.
     """
     try:
-        import aiohttp  # noqa: F401
+        import aiohttp  # type: ignore[reportMissingImports]  # noqa: F401
         return True
     except ImportError:
         pass

@@ -1,6 +1,6 @@
 """Tests for the Hermes RocketChatAdapter class."""
 
-import pytest
+import pytest  # type: ignore[reportMissingImports]
 
 from adapter import (
     RocketChatAdapter,
@@ -20,6 +20,7 @@ class FakeClient:
     def __init__(self, identity=None):
         self._identity = identity
         self.post_message_calls: list[dict] = []
+        self.update_message_calls: list[dict] = []
         self.initialize_calls = 0
         self._user_id = "bot1"
         self._access_token = "tok"
@@ -40,6 +41,11 @@ class FakeClient:
         call = {"room_id": room_id, "text": text, "tmid": tmid}
         self.post_message_calls.append(call)
         return {"_id": f"sent-{len(self.post_message_calls)}"}
+
+    async def update_message(self, room_id, message_id, text):
+        call = {"room_id": room_id, "message_id": message_id, "text": text}
+        self.update_message_calls.append(call)
+        return {"_id": message_id}
 
     @property
     def identity(self):
@@ -225,6 +231,48 @@ async def test_adapter_send_gateway_thread_metadata_uses_thread_id():
 
     assert result.success
     assert client.post_message_calls[0]["tmid"] == "parent-thread-id"
+
+
+@pytest.mark.asyncio
+async def test_adapter_send_typing_posts_placeholder_once_then_final_send_edits_it():
+    """Hermes typing refresh should create one visible placeholder and final send should consume it."""
+    adapter = RocketChatAdapter(RocketChatConfig())
+    client = FakeClient()
+    setattr(adapter, "_client", client)
+    adapter._connected = True
+
+    await adapter.send_typing("room-1")
+    await adapter.send_typing("room-1")
+    result = await adapter.send("room-1", "final answer", metadata={"notify": True})
+
+    assert result.success
+    assert client.post_message_calls == [
+        {"room_id": "room-1", "text": "💭 Thinking…", "tmid": ""}
+    ]
+    assert client.update_message_calls == [
+        {"room_id": "room-1", "message_id": "sent-1", "text": "final answer"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_adapter_stop_typing_before_final_send_keeps_placeholder_for_edit():
+    """Gateway stops typing before final delivery; final send must still edit the placeholder."""
+    adapter = RocketChatAdapter(RocketChatConfig())
+    client = FakeClient()
+    setattr(adapter, "_client", client)
+    adapter._connected = True
+
+    await adapter.send_typing("room-1")
+    await adapter.stop_typing("room-1")
+    result = await adapter.send("room-1", "final answer", metadata={"notify": True})
+
+    assert result.success
+    assert client.post_message_calls == [
+        {"room_id": "room-1", "text": "💭 Thinking…", "tmid": ""}
+    ]
+    assert client.update_message_calls == [
+        {"room_id": "room-1", "message_id": "sent-1", "text": "final answer"}
+    ]
 
 
 @pytest.mark.asyncio
