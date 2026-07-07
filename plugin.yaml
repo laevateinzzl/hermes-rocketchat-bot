@@ -50,3 +50,27 @@ optional_env:
     description: Default room ID for cron and proactive delivery
     prompt: Home room ID
     password: false
+  - name: ROCKETCHAT_RECEIVE_TIMEOUT
+    description: Seconds without a WebSocket frame before sending a heartbeat ping (default 60)
+    prompt: Receive timeout seconds
+    password: false
+  - name: ROCKETCHAT_PING_TIMEOUT
+    description: Seconds to wait for a heartbeat ping response before reconnecting (default 10)
+    prompt: Ping timeout seconds
+    password: false
+  - name: ROCKETCHAT_RECONNECT_INITIAL_DELAY
+    description: Initial WebSocket reconnect delay in seconds (default 1)
+    prompt: Reconnect initial delay
+    password: false
+  - name: ROCKETCHAT_RECONNECT_MAX_DELAY
+    description: Cap for exponential backoff reconnect delay in seconds (default 60)
+    prompt: Reconnect max delay
+    password: false
+  - name: ROCKETCHAT_RECONNECT_MAX_ATTEMPTS
+    description: Max reconnect attempts before giving up; 0 means unlimited (default 0)
+    prompt: Reconnect max attempts
+    password: false
+  - name: ROCKETCHAT_RECONNECT_JITTER
+    description: Jitter fraction (0-0.5) applied to each reconnect delay (default 0.25)
+    prompt: Reconnect jitter
+    password: false

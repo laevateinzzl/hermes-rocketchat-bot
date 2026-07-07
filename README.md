@@ -107,6 +107,38 @@ ROCKETCHAT_TRANSPORT=polling
 ROCKETCHAT_POLL_INTERVAL_SECONDS=3
 ```
 
+### Reconnect & heartbeat (WebSocket)
+
+The WebSocket transport detects dropped connections and reconnects
+automatically, so the bot comes back online when the Rocket.Chat server
+restarts or becomes reachable again after downtime (e.g. overnight).
+
+- **Heartbeat:** if no frame arrives within `ROCKETCHAT_RECEIVE_TIMEOUT`
+  seconds (default `60`), the transport sends a DDP ping. If no response
+  arrives within `ROCKETCHAT_PING_TIMEOUT` seconds (default `10`), the
+  connection is treated as dead and reconnected. This catches silently
+dropped connections (server powered off without a TCP FIN) that would
+  otherwise leave the bot hung forever.
+- **Backoff:** reconnects use exponential backoff with jitter, starting at
+  `ROCKETCHAT_RECONNECT_INITIAL_DELAY` (default `1`s) and capped at
+  `ROCKETCHAT_RECONNECT_MAX_DELAY` (default `60`s). A server down for hours
+  is retried at most once a minute, so the log is not flooded and the server
+  is not hammered.
+- **Re-authentication:** if the resume token is rejected (e.g. after a
+  server restart invalidated it), the client re-runs login automatically.
+- **Attempt cap:** `ROCKETCHAT_RECONNECT_MAX_ATTEMPTS` (default `0` =
+  unlimited) gives up after N failed attempts.
+
+```bash
+# Tuning for long overnight downtime (defaults shown)
+ROCKETCHAT_RECEIVE_TIMEOUT=60
+ROCKETCHAT_PING_TIMEOUT=10
+ROCKETCHAT_RECONNECT_INITIAL_DELAY=1
+ROCKETCHAT_RECONNECT_MAX_DELAY=60
+ROCKETCHAT_RECONNECT_MAX_ATTEMPTS=0   # 0 = retry forever
+ROCKETCHAT_RECONNECT_JITTER=0.25      # ±25% randomization
+```
+
 ### Security: user allowlist
 
 Control who can talk to the bot.  At least one of the following must be set
@@ -210,6 +242,8 @@ python -m ruff check .
 |---|---|
 | Plugin does not auto-enable | `ROCKETCHAT_SERVER_URL` or auth vars missing |
 | Messages not received | Token expired, wrong transport, or WebSocket blocked |
+| Bot offline after server downtime | WebSocket hung on a dead connection — ensure `ROCKETCHAT_RECEIVE_TIMEOUT` is set (default 60s) so the heartbeat detects the drop |
+| Bot never reconnects | Check `ROCKETCHAT_RECONNECT_MAX_ATTEMPTS` isn't set too low; 0 means unlimited |
 | Bot ignores channel messages | Mention alias not configured; use `ROCKETCHAT_MENTION_NAMES` |
 | Attachments not forwarded | `ROCKETCHAT_MEDIA_CACHE_DIR` not set or not writable |
 | "Not connected" errors | Check server URL is reachable and credentials are valid |

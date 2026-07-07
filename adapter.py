@@ -39,6 +39,13 @@ class RocketChatConfig:
     allowed_users: list[str] = field(default_factory=list)
     allow_all: bool = False
     max_message_length: int = 4000
+    # Reconnect / heartbeat tuning (WebSocket transport)
+    receive_timeout: float = 60.0
+    ping_timeout: float = 10.0
+    reconnect_initial_delay: float = 1.0
+    reconnect_max_delay: float = 60.0
+    reconnect_max_attempts: int = 0  # 0 = unlimited
+    reconnect_jitter: float = 0.25
 
 
 def _parse_bool(value: Any | None) -> bool:
@@ -106,6 +113,12 @@ def parse_config(extra: dict[str, Any] | None = None) -> RocketChatConfig:
         allowed_users=_parse_csv(extra.get("allowed_users") or os.environ.get("ROCKETCHAT_ALLOWED_USERS", "")),
         allow_all=_parse_bool(extra.get("allow_all") or os.environ.get("ROCKETCHAT_ALLOW_ALL_USERS")),
         max_message_length=_parse_int_safe(extra.get("max_message_length") or os.environ.get("ROCKETCHAT_MAX_MESSAGE_LENGTH", "4000"), 4000),
+        receive_timeout=_parse_float_safe(extra.get("receive_timeout") or os.environ.get("ROCKETCHAT_RECEIVE_TIMEOUT", "60"), 60.0),
+        ping_timeout=_parse_float_safe(extra.get("ping_timeout") or os.environ.get("ROCKETCHAT_PING_TIMEOUT", "10"), 10.0),
+        reconnect_initial_delay=_parse_float_safe(extra.get("reconnect_initial_delay") or os.environ.get("ROCKETCHAT_RECONNECT_INITIAL_DELAY", "1"), 1.0),
+        reconnect_max_delay=_parse_float_safe(extra.get("reconnect_max_delay") or os.environ.get("ROCKETCHAT_RECONNECT_MAX_DELAY", "60"), 60.0),
+        reconnect_max_attempts=_parse_int_safe(extra.get("reconnect_max_attempts") or os.environ.get("ROCKETCHAT_RECONNECT_MAX_ATTEMPTS", "0"), 0),
+        reconnect_jitter=_parse_float_safe(extra.get("reconnect_jitter") or os.environ.get("ROCKETCHAT_RECONNECT_JITTER", "0.25"), 0.25),
     )
 
     return cfg
@@ -1020,29 +1033,78 @@ class WebSocketTransport:
     Connects to Rocket.Chat's WebSocket endpoint, performs the DDP handshake
     (connect, login, subscribe), and emits normalized inbound message events.
 
+    Reconnect strategy
+    ------------------
+    On disconnection the transport reconnects with exponential backoff plus
+    jitter, so a server that is down for hours does not flood the logs or
+    hammer the endpoint.  When the handshake reports an auth/token error the
+    client is re-authenticated before the next attempt, so a server restart
+    that invalidates the resume token is recovered automatically.
+
+    A receive timeout + DDP ping heartbeat lets the transport detect a
+    silently dropped connection (e.g. the server was powered off without
+    sending a TCP FIN) instead of blocking forever on ``receive()``.
+
     Parameters
     ----------
     client:
         A ``RocketChatClient`` instance (or compatible) for REST calls such as
-        listing subscriptions.
+        listing subscriptions and re-authentication.
     ws_url:
         The WebSocket endpoint URL.  Defaults to ``_ws_url(client.server_url)``.
     ws_factory:
         Optional async callable that returns a WebSocket connection object.
         When *None* (the default) a real aiohttp ``ws_connect`` is used.
+    receive_timeout:
+        Seconds to wait for a frame before sending a DDP ping.  Default 60.
+    ping_timeout:
+        Seconds to wait for any frame after sending a ping before declaring
+        the connection dead.  Default 10.
+    reconnect_initial_delay:
+        Initial reconnect delay in seconds.  Default 1.
+    reconnect_max_delay:
+        Cap for the exponential backoff in seconds.  Default 60.
+    reconnect_max_attempts:
+        Maximum reconnect attempts before giving up.  ``0`` means unlimited.
+    reconnect_jitter:
+        Jitter fraction (0..0.5) applied to each delay.  Default 0.25.
     """
 
-    def __init__(self, client: Any, ws_url: str = "", ws_factory: Any = None):
+    def __init__(
+        self,
+        client: Any,
+        ws_url: str = "",
+        ws_factory: Any = None,
+        *,
+        receive_timeout: float = 60.0,
+        ping_timeout: float = 10.0,
+        reconnect_initial_delay: float = 1.0,
+        reconnect_max_delay: float = 60.0,
+        reconnect_max_attempts: int = 0,
+        reconnect_jitter: float = 0.25,
+    ):
         self._client = client
         self.ws_url = ws_url or _ws_url(client.server_url)
         self._ws_factory = ws_factory or self._default_ws_factory
         self._on_message: Any = None
+        self._on_status: Any = None
         self._running = False
         self._task: asyncio.Task[Any] | None = None
         self._seen_ids: set[str] = set()
         self._sub_ids: set[str] = set()
         # Cache room type from subscriptions so we can tag inbound events
         self._room_types: dict[str, str] = {}
+        # Heartbeat / reconnect tuning (defensive: config may already be parsed)
+        self._receive_timeout = max(0.01, _parse_float_safe(receive_timeout, 60.0))
+        self._ping_timeout = max(0.01, _parse_float_safe(ping_timeout, 10.0))
+        self._initial_delay = max(0.01, _parse_float_safe(reconnect_initial_delay, 1.0))
+        self._max_delay = max(self._initial_delay, _parse_float_safe(reconnect_max_delay, 60.0))
+        self._max_attempts = max(0, _parse_int_safe(reconnect_max_attempts, 0))
+        self._jitter = max(0.0, min(0.5, _parse_float_safe(reconnect_jitter, 0.25)))
+        # Reconnect bookkeeping (reset on a successful handshake)
+        self._reconnect_attempts = 0
+        # aiohttp session owned by the default factory, closed on reconnect/stop
+        self._http_session: Any = None
 
     # -- public API -----------------------------------------------------------
 
@@ -1050,41 +1112,93 @@ class WebSocketTransport:
         """Register an async callback ``callback(event: dict)`` for inbound messages."""
         self._on_message = callback
 
+    def set_on_status(self, callback: Any) -> None:
+        """Register an async callback ``callback(status: str, detail: dict)``.
+
+        Status is one of ``"connected"``, ``"reconnecting"``, ``"stopped"``,
+        or ``"failed"``.  ``detail`` carries attempt count / delay / reason.
+        """
+        self._on_status = callback
+
     async def start(self) -> None:
         """Begin the WebSocket receive loop in the background."""
         self._running = True
+        self._reconnect_attempts = 0
         self._task = asyncio.create_task(self._receive_loop())
 
     async def stop(self) -> None:
-        """Stop the WebSocket loop."""
+        """Stop the WebSocket loop and release any aiohttp session."""
         self._running = False
         if self._task:
             self._task.cancel()
             try:
                 await self._task
-            except (Exception, asyncio.CancelledError):
+            except asyncio.CancelledError as _exc:
                 pass
+            except Exception as _exc:
+                pass
+        await self._close_http_session()
+        self._emit_status("stopped", {"reason": "stop requested"})
+
+    # -- status helper --------------------------------------------------------
+
+    def _emit_status(self, status: str, detail: dict[str, Any] | None = None) -> None:
+        """Best-effort status notification to the registered callback."""
+        if self._on_status is None:
+            return
+        try:
+            self._on_status(status, detail or {})
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Error in on_status callback")
+
+    # -- backoff helper -------------------------------------------------------
+
+    def _next_reconnect_delay(self) -> float:
+        """Compute the next reconnect delay using exponential backoff + jitter."""
+        import random
+
+        base = self._initial_delay * (2 ** self._reconnect_attempts)
+        base = min(base, self._max_delay)
+        jitter = base * self._jitter
+        return base + random.uniform(-jitter, jitter)
 
     # -- WebSocket factory ----------------------------------------------------
 
     async def _default_ws_factory(self) -> Any:
-        """Create a real aiohttp WebSocket connection."""
+        """Create a real aiohttp WebSocket connection.
+
+        Closes any previously created ``ClientSession`` first so that repeated
+        reconnects do not leak sessions / file descriptors.
+        """
         try:
             import aiohttp  # type: ignore[reportMissingImports]
-
-            session = aiohttp.ClientSession()
-            # Store the session so it can be closed later
-            self._http_session = session
-            return await session.ws_connect(self.ws_url)
         except ImportError:
             raise RuntimeError(
                 "WebSocket transport requires aiohttp. Install with: pip install aiohttp"
             )
 
+        # Close the previous session before opening a new one to avoid fd leaks
+        await self._close_http_session()
+        session = aiohttp.ClientSession()
+        self._http_session = session
+        return await session.ws_connect(self.ws_url)
+
+    async def _close_http_session(self) -> None:
+        """Close the aiohttp session owned by the default factory, if any."""
+        session = self._http_session
+        self._http_session = None
+        if session is None:
+            return
+        try:
+            await session.close()
+        except Exception:
+            pass
+
     # -- receive loop ---------------------------------------------------------
 
     async def _receive_loop(self) -> None:
-        """Main receive loop with reconnect on failure."""
+        """Main receive loop with heartbeat + exponential-backoff reconnect."""
         import logging
 
         log = logging.getLogger(__name__)
@@ -1096,20 +1210,117 @@ class WebSocketTransport:
                 await self._handshake(ws)
                 await self._bootstrap_subscriptions(ws)
 
-                while self._running:
-                    frame = await _ws_recv_text(ws)
-                    await self._handle_frame(frame, ws)
+                # Successful connect: reset backoff and notify
+                self._reconnect_attempts = 0
+                self._emit_status("connected", {})
 
-            except (ConnectionError, OSError, RuntimeError, RocketChatClientError):
-                if self._running:
-                    log.warning("WebSocket error, reconnecting in 3s…")
-                    await asyncio.sleep(3)
+                await self._read_loop(ws)
+
+            except asyncio.CancelledError as _exc:
+                raise
+            except Exception as exc:
+                await self._handle_connection_error(exc, log)
             finally:
                 if ws is not None:
                     try:
                         await ws.close()
-                    except Exception:
+                    except Exception as _close_exc:
                         pass
+                # Always release the session tied to this attempt
+                await self._close_http_session()
+
+    async def _read_loop(self, ws: Any) -> None:
+        """Read frames with a heartbeat timeout.
+
+        If no frame arrives within ``receive_timeout``, send a DDP ping and
+        wait up to ``ping_timeout`` for any response.  No response means the
+        connection is silently dead → raise ``ConnectionError`` to trigger
+        reconnect.
+        """
+        while self._running:
+            try:
+                frame = await asyncio.wait_for(
+                    _ws_recv_text(ws), timeout=self._receive_timeout
+                )
+            except asyncio.TimeoutError as _timeout:
+                # No traffic for a while — probe the connection with a ping
+                await _ws_send_text(ws, json.dumps({"msg": "ping"}))
+                try:
+                    await asyncio.wait_for(
+                        _ws_recv_text(ws), timeout=self._ping_timeout
+                    )
+                except asyncio.TimeoutError as _ping_timeout:
+                    raise ConnectionError(
+                        f"WebSocket unresponsive: no frame within "
+                        f"{self._receive_timeout}s + ping {self._ping_timeout}s"
+                    )
+                continue
+            await self._handle_frame(frame, ws)
+
+    async def _handle_connection_error(self, exc: Exception, log: Any) -> None:
+        """Handle a connection/auth error between reconnect attempts.
+
+        Extracted from ``_receive_loop`` so boolean logic lives outside the
+        ``except`` body (lint: no-boolean-in-except).  Re-authenticates on
+        auth errors, applies backoff, and emits status.  Stops the loop when
+        the max-attempt cap is reached.
+        """
+        # Auth errors: re-authenticate before the next attempt so a server
+        # restart that invalidated the resume token recovers.
+        if self._is_auth_error(exc):
+            log.warning("WebSocket auth error (%s); re-authenticating", exc)
+            await self._reauthenticate()
+        if not self._running:
+            return
+        self._reconnect_attempts += 1
+        reached_cap = (
+            self._max_attempts > 0
+            and self._reconnect_attempts > self._max_attempts
+        )
+        if reached_cap:
+            log.error(
+                "WebSocket reconnect gave up after %d attempts",
+                self._reconnect_attempts,
+            )
+            self._emit_status(
+                "failed", {"attempts": self._reconnect_attempts, "reason": str(exc)}
+            )
+            self._running = False
+            return
+        delay = self._next_reconnect_delay()
+        log.warning(
+            "WebSocket error (%s); reconnecting in %.1fs (attempt %d)",
+            exc,
+            delay,
+            self._reconnect_attempts,
+        )
+        self._emit_status(
+            "reconnecting",
+            {"attempt": self._reconnect_attempts, "delay": delay, "reason": str(exc)},
+        )
+        await asyncio.sleep(delay)
+
+    @staticmethod
+    def _is_auth_error(exc: Exception) -> bool:
+        """Heuristic: does this error indicate the resume token is invalid?"""
+        text = str(exc).lower()
+        return (
+            "auth" in text
+            or "401" in text
+            or "unauthorized" in text
+            or "token" in text
+            or "resume" in text
+        )
+
+    async def _reauthenticate(self) -> None:
+        """Re-run client initialization to obtain a fresh auth token."""
+        try:
+            await self._client.initialize()
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Re-authentication failed; will retry on next reconnect"
+            )
 
     # -- DDP handshake --------------------------------------------------------
 
@@ -1301,6 +1512,28 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         """Store the Hermes message handler for inbound dispatch."""
         self._message_handler = handler
 
+    def _on_transport_status(self, status: str, detail: dict[str, Any]) -> None:
+        """Log WebSocket transport status changes for observability."""
+        import logging
+        log = logging.getLogger(__name__)
+        if status == "connected":
+            log.info("Rocket.Chat WebSocket connected")
+        elif status == "reconnecting":
+            log.warning(
+                "Rocket.Chat WebSocket reconnecting (attempt %s, delay %.1fs): %s",
+                detail.get("attempt"),
+                detail.get("delay", 0.0),
+                detail.get("reason", ""),
+            )
+        elif status == "failed":
+            log.error(
+                "Rocket.Chat WebSocket reconnect failed after %s attempts: %s",
+                detail.get("attempts"),
+                detail.get("reason", ""),
+            )
+        elif status == "stopped":
+            log.info("Rocket.Chat WebSocket transport stopped")
+
     async def connect(self, *args: Any, **kwargs: Any) -> bool:
         """Parse config, authenticate, and start the selected transport.
 
@@ -1342,7 +1575,17 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         transport_type = self._cfg.transport.lower()
 
         if transport_type == "websocket":
-            self._transport = WebSocketTransport(client=self._client)
+            self._transport = WebSocketTransport(
+                client=self._client,
+                receive_timeout=self._cfg.receive_timeout,
+                ping_timeout=self._cfg.ping_timeout,
+                reconnect_initial_delay=self._cfg.reconnect_initial_delay,
+                reconnect_max_delay=self._cfg.reconnect_max_delay,
+                reconnect_max_attempts=self._cfg.reconnect_max_attempts,
+                reconnect_jitter=self._cfg.reconnect_jitter,
+            )
+            # Surface connection status in the adapter log for observability
+            self._transport.set_on_status(self._on_transport_status)
         else:
             self._transport = PollingTransport(
                 client=self._client,
