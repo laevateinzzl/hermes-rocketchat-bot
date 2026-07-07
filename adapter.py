@@ -46,6 +46,10 @@ class RocketChatConfig:
     reconnect_max_delay: float = 60.0
     reconnect_max_attempts: int = 0  # 0 = unlimited
     reconnect_jitter: float = 0.25
+    # Inbound dedup (WebSocket transport) — suppress replayed messages after reconnect
+    dedup_enabled: bool = True
+    dedup_ttl_hours: float = 168.0  # 7 days
+    dedup_store_path: str = ""
 
 
 def _parse_bool(value: Any | None) -> bool:
@@ -119,6 +123,9 @@ def parse_config(extra: dict[str, Any] | None = None) -> RocketChatConfig:
         reconnect_max_delay=_parse_float_safe(extra.get("reconnect_max_delay") or os.environ.get("ROCKETCHAT_RECONNECT_MAX_DELAY", "60"), 60.0),
         reconnect_max_attempts=_parse_int_safe(extra.get("reconnect_max_attempts") or os.environ.get("ROCKETCHAT_RECONNECT_MAX_ATTEMPTS", "0"), 0),
         reconnect_jitter=_parse_float_safe(extra.get("reconnect_jitter") or os.environ.get("ROCKETCHAT_RECONNECT_JITTER", "0.25"), 0.25),
+        dedup_enabled=_parse_bool(extra.get("dedup_enabled") or os.environ.get("ROCKETCHAT_DEDUP_ENABLED", "true")),
+        dedup_ttl_hours=_parse_float_safe(extra.get("dedup_ttl_hours") or os.environ.get("ROCKETCHAT_DEDUP_TTL_HOURS", "168"), 168.0),
+        dedup_store_path=str(extra.get("dedup_store_path") or os.environ.get("ROCKETCHAT_DEDUP_STORE_PATH", "")),
     )
 
     return cfg
@@ -787,6 +794,100 @@ class InMemoryCheckpointStore:
     def save(self, room_id: str, updated_at):
         """Store the latest timestamp for a room."""
         self._checkpoints[room_id] = updated_at
+
+
+class PersistentSeenIdStore:
+    """Disk-backed seen-message-id store for WebSocket reconnect dedup.
+
+    Rocket.Chat's ``stream-room-messages`` subscription can replay recent
+    unread messages when a WebSocket reconnects (even with
+    ``useHistory=False``).  The transport's in-memory ``_seen_ids`` set is
+    lost on reconnect/restart, so the adapter layer keeps this persistent
+    store to suppress messages it has already handled.
+
+    Entries expire after ``ttl_seconds`` (default 7 days) so the file does
+    not grow without bound.  Writes are atomic (temp file + rename).
+    """
+
+    def __init__(self, path: str = "", ttl_seconds: float = 7 * 24 * 3600):
+        import time
+        self._path = path
+        self._ttl = max(1.0, _parse_float_safe(ttl_seconds, 7 * 24 * 3600))
+        self._seen: dict[str, float] = {}
+        self._dirty = False
+        self._load()
+
+    def _load(self) -> None:
+        """Load seen ids from disk, dropping expired entries."""
+        if not self._path:
+            return
+        import json
+        import os
+        try:
+            with open(self._path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        if not isinstance(data, dict):
+            return
+        import time
+        now = time.time()
+        self._seen = {}
+        for k, v in data.items():
+            ts = _parse_float_safe(v, 0.0)
+            if ts and now - ts < self._ttl:
+                self._seen[str(k)] = ts
+
+    def contains(self, msg_id: str) -> bool:
+        """Return True if *msg_id* was already seen and is still valid."""
+        if not msg_id:
+            return False
+        import time
+        ts = self._seen.get(msg_id)
+        if ts is None:
+            return False
+        if time.time() - ts > self._ttl:
+            # Expired — drop lazily
+            self._seen.pop(msg_id, None)
+            self._dirty = True
+            return False
+        return True
+
+    def mark(self, msg_id: str) -> None:
+        """Record *msg_id* as seen now."""
+        if not msg_id:
+            return
+        import time
+        self._seen[msg_id] = time.time()
+        self._dirty = True
+
+    def flush(self) -> None:
+        """Persist the store to disk atomically if there are pending changes."""
+        if not self._path or not self._dirty:
+            return
+        import json
+        import os
+        import tempfile
+        directory = os.path.dirname(self._path)
+        if directory:
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except OSError:
+                pass
+        # Prune expired entries before writing
+        import time
+        now = time.time()
+        self._seen = {
+            k: v for k, v in self._seen.items() if now - v < self._ttl
+        }
+        try:
+            fd, tmp = tempfile.mkstemp(dir=directory or ".", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(self._seen, fh)
+            os.replace(tmp, self._path)
+            self._dirty = False
+        except OSError:
+            pass
 
 
 class PollingTransport:
@@ -1493,6 +1594,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         self._room_info: dict[str, dict[str, Any]] = {}
         self._typing_placeholders: dict[str, str] = {}
         self._cfg: RocketChatConfig | None = None
+        self._seen_id_store: PersistentSeenIdStore | None = None
 
         super().__init__(config=config, platform=_resolve_hermes_platform())
 
@@ -1506,7 +1608,39 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             elif isinstance(config, dict):
                 self._cfg = parse_config(config)
 
+        # Build the persistent seen-id store for WebSocket dedup.  Done here
+        # so the store is ready before ``connect`` runs and survives reconnects
+        # within the adapter's lifetime.
+        self._init_seen_id_store()
+
     # -- lifecycle ------------------------------------------------------------
+
+    def _init_seen_id_store(self) -> None:
+        """Create the persistent seen-id store for WebSocket inbound dedup.
+
+        Only active under the WebSocket transport; polling has its own
+        checkpoint-based dedup and never replays.  The store path defaults to
+        ``<HERMES_HOME>/rocketchat_seen_ids.json`` so it survives gateway
+        restarts.
+        """
+        cfg = self._cfg
+        if cfg is None or not cfg.dedup_enabled:
+            self._seen_id_store = None
+            return
+        if cfg.transport.lower() != "websocket":
+            self._seen_id_store = None
+            return
+        path = cfg.dedup_store_path
+        if not path:
+            hermes_home = os.environ.get("HERMES_HOME", "")
+            if hermes_home:
+                path = os.path.join(hermes_home, "rocketchat_seen_ids.json")
+            else:
+                path = os.path.join(os.path.expanduser("~"), ".hermes", "rocketchat_seen_ids.json")
+        self._seen_id_store = PersistentSeenIdStore(
+            path=path,
+            ttl_seconds=max(1.0, cfg.dedup_ttl_hours) * 3600,
+        )
 
     def set_message_handler(self, handler: Any) -> None:
         """Store the Hermes message handler for inbound dispatch."""
@@ -1778,6 +1912,22 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         # Skip Rocket.Chat system messages (t field = "uj", "ul", etc.)
         if event.get("t"):
             return
+
+        # Persistent dedup (WebSocket): suppress messages replayed by the
+        # server after a reconnect/restart.  The transport's in-memory
+        # _seen_ids is lost on reconnect, so this disk-backed store is the
+        # authoritative guard against duplicate inbound delivery.
+        msg_id = str(event.get("_id") or "")
+        if self._seen_id_store is not None:
+            if self._seen_id_store.contains(msg_id):
+                import logging
+                logging.getLogger(__name__).debug(
+                    "Rocket.Chat inbound dedup: skipping already-seen msg_id=%s", msg_id
+                )
+                return
+            if msg_id:
+                self._seen_id_store.mark(msg_id)
+                self._seen_id_store.flush()
 
         # Mention gating for non-DM rooms
         if chat_type != "dm":

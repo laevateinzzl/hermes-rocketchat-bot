@@ -139,6 +139,24 @@ ROCKETCHAT_RECONNECT_MAX_ATTEMPTS=0   # 0 = retry forever
 ROCKETCHAT_RECONNECT_JITTER=0.25      # ±25% randomization
 ```
 
+### Inbound dedup (WebSocket)
+
+When the WebSocket reconnects (or the gateway restarts), Rocket.Chat's
+`stream-room-messages` subscription can replay recent unread messages. Without
+dedup this causes the bot to answer the same user message multiple times with
+**different** replies (one per replay). The adapter keeps a disk-backed
+seen-message-id store so replays are suppressed.
+
+- Enabled by default under the WebSocket transport (`ROCKETCHAT_DEDUP_ENABLED=true`).
+- Disabled automatically for polling (it has its own checkpoint dedup).
+- Seen ids persist to `$HERMES_HOME/rocketchat_seen_ids.json` and survive
+  gateway restarts. Override the path with `ROCKETCHAT_DEDUP_STORE_PATH`.
+- Entries expire after `ROCKETCHAT_DEDUP_TTL_HOURS` (default `168` = 7 days)
+  so the file does not grow without bound.
+
+This only suppresses exact message-id replays. A user manually re-sending the
+same text gets a new message id and is answered normally.
+
 ### Security: user allowlist
 
 Control who can talk to the bot.  At least one of the following must be set

@@ -74,3 +74,15 @@ optional_env:
     description: Jitter fraction (0-0.5) applied to each reconnect delay (default 0.25)
     prompt: Reconnect jitter
     password: false
+  - name: ROCKETCHAT_DEDUP_ENABLED
+    description: Suppress replayed inbound messages after WebSocket reconnect (default true)
+    prompt: Inbound dedup enabled
+    password: false
+  - name: ROCKETCHAT_DEDUP_TTL_HOURS
+    description: Hours to remember seen message ids for dedup (default 168 = 7 days)
+    prompt: Dedup TTL hours
+    password: false
+  - name: ROCKETCHAT_DEDUP_STORE_PATH
+    description: Path to the persistent seen-id store file (default $HERMES_HOME/rocketchat_seen_ids.json)
+    prompt: Dedup store path
+    password: false

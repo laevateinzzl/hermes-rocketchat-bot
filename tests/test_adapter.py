@@ -6,6 +6,7 @@ from adapter import (
     RocketChatAdapter,
     RocketChatConfig,
     RocketChatIdentity,
+    PersistentSeenIdStore,
 )
 
 
@@ -520,3 +521,186 @@ def test_build_source_channel():
     )
     assert source["chat_type"] == "channel"
     assert source["room_name"] == "general"
+
+
+# ---------------------------------------------------------------------------
+# Persistent seen-id dedup tests
+# ---------------------------------------------------------------------------
+
+
+def test_seen_id_store_dedup_second_call_suppressed(tmp_path):
+    """The same message id should be seen on first mark and suppressed after."""
+    store_path = str(tmp_path / "seen.json")
+    store = PersistentSeenIdStore(path=store_path, ttl_seconds=3600)
+    assert not store.contains("msg-1")
+    store.mark("msg-1")
+    assert store.contains("msg-1")
+
+
+def test_seen_id_store_persists_across_instances(tmp_path):
+    """A new store loading the same file should remember previously marked ids."""
+    store_path = str(tmp_path / "seen.json")
+    store1 = PersistentSeenIdStore(path=store_path, ttl_seconds=3600)
+    store1.mark("msg-persist")
+    store1.flush()
+
+    store2 = PersistentSeenIdStore(path=store_path, ttl_seconds=3600)
+    assert store2.contains("msg-persist")
+
+
+def test_seen_id_store_ttl_expires_old_entries(tmp_path):
+    """Entries older than ttl should be treated as not-seen."""
+    import time
+    store_path = str(tmp_path / "seen.json")
+    store = PersistentSeenIdStore(path=store_path, ttl_seconds=1.0)
+    store.mark("msg-old")
+    # Backdate the entry so it is older than ttl
+    store._seen["msg-old"] = time.time() - 10
+    store.flush()
+
+    store2 = PersistentSeenIdStore(path=store_path, ttl_seconds=1.0)
+    assert not store2.contains("msg-old")
+
+
+def test_seen_id_store_empty_id_not_deduped(tmp_path):
+    """An empty message id should never be reported as seen (no false positives)."""
+    store = PersistentSeenIdStore(path=str(tmp_path / "seen.json"), ttl_seconds=3600)
+    assert not store.contains("")
+    store.mark("")
+    assert not store.contains("")
+
+
+def test_seen_id_store_atomic_write(tmp_path):
+    """flush() should write a valid JSON file (no partial/corrupt files)."""
+    import json
+    store_path = str(tmp_path / "seen.json")
+    store = PersistentSeenIdStore(path=store_path, ttl_seconds=3600)
+    store.mark("m1")
+    store.mark("m2")
+    store.flush()
+    with open(store_path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    assert "m1" in data and "m2" in data
+
+
+def test_dedup_disabled_for_polling_transport():
+    """The seen-id store should not be created under polling transport."""
+    cfg = RocketChatConfig(transport="polling", dedup_enabled=True)
+    adapter = RocketChatAdapter(cfg)
+    assert adapter._seen_id_store is None
+
+
+def test_dedup_enabled_for_websocket_transport(tmp_path):
+    """The seen-id store should be created under websocket transport."""
+    cfg = RocketChatConfig(
+        transport="websocket",
+        dedup_enabled=True,
+        dedup_store_path=str(tmp_path / "seen.json"),
+    )
+    adapter = RocketChatAdapter(cfg)
+    assert adapter._seen_id_store is not None
+
+
+def test_dedup_disabled_when_flag_off():
+    """dedup_enabled=False should skip the store even for websocket."""
+    cfg = RocketChatConfig(transport="websocket", dedup_enabled=False)
+    adapter = RocketChatAdapter(cfg)
+    assert adapter._seen_id_store is None
+
+
+@pytest.mark.asyncio
+async def test_on_inbound_dedup_suppresses_replayed_message(tmp_path):
+    """A second _on_inbound call with the same _id should not reach handle_message."""
+    cfg = RocketChatConfig(
+        server_url="https://chat.example.com",
+        auth_mode="token",
+        user_id="u1",
+        access_token="tok",
+        transport="websocket",
+        dedup_enabled=True,
+        dedup_store_path=str(tmp_path / "seen.json"),
+    )
+    adapter = RocketChatAdapter(cfg)
+    setattr(adapter, "_client", FakeClient())
+    adapter._connected = True
+
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+
+    adapter.handle_message = fake_handle  # type: ignore[method-assign]
+
+    dm_event = {
+        "_id": "replay-msg-1",
+        "rid": "dm-room-1",
+        "msg": "hello bot",
+        "u": {"_id": "alice", "username": "alice"},
+        "t": "",
+        "mentions": [],
+        "_room_type": "d",
+    }
+
+    # First delivery: should be handled
+    await adapter._on_inbound(dm_event)
+    assert len(handled) == 1
+
+    # Replay (e.g. after a reconnect): should be suppressed
+    await adapter._on_inbound(dm_event)
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_inbound_dedup_persists_across_adapter_restart(tmp_path):
+    """A replayed message should be suppressed even after the adapter is rebuilt.
+
+    This mirrors the real-world bug: gateway restart → WebSocket resubscribes
+    → server replays recent unread messages → bot answers twice.
+    """
+    store_path = str(tmp_path / "seen.json")
+    cfg = RocketChatConfig(
+        server_url="https://chat.example.com",
+        auth_mode="token",
+        user_id="u1",
+        access_token="tok",
+        transport="websocket",
+        dedup_enabled=True,
+        dedup_store_path=store_path,
+    )
+
+    handled1 = []
+    adapter1 = RocketChatAdapter(cfg)
+    setattr(adapter1, "_client", FakeClient())
+    adapter1._connected = True
+
+    async def fake_handle1(event):
+        handled1.append(event)
+
+    adapter1.handle_message = fake_handle1  # type: ignore[method-assign]
+
+    dm_event = {
+        "_id": "persist-replay-1",
+        "rid": "dm-room-1",
+        "msg": "audit q2 code",
+        "u": {"_id": "alice", "username": "alice"},
+        "t": "",
+        "mentions": [],
+        "_room_type": "d",
+    }
+    await adapter1._on_inbound(dm_event)
+    assert len(handled1) == 1
+
+    # Simulate a gateway restart: brand-new adapter, same store path
+    handled2 = []
+    adapter2 = RocketChatAdapter(cfg)
+    setattr(adapter2, "_client", FakeClient())
+    adapter2._connected = True
+
+    async def fake_handle2(event):
+        handled2.append(event)
+
+    adapter2.handle_message = fake_handle2  # type: ignore[method-assign]
+
+    # Server replays the same message after restart — must be suppressed
+    await adapter2._on_inbound(dm_event)
+    assert len(handled2) == 0
