@@ -1,7 +1,7 @@
 name: rocketchat-platform
 label: Rocket.Chat
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: Rocket.Chat gateway adapter for Hermes Agent
 author: hermes-rocketchat-bot
 requires_env:
@@ -37,6 +37,14 @@ optional_env:
   - name: ROCKETCHAT_MENTION_NAMES
     description: Comma-separated aliases that trigger the bot in rooms
     prompt: Mention aliases
+    password: false
+  - name: ROCKETCHAT_ALWAYS_RESPOND_ROOMS
+    description: Comma-separated room IDs where the bot responds to every message without a mention
+    prompt: Always-respond room IDs
+    password: false
+  - name: ROCKETCHAT_IGNORE_OTHER_USER_MENTIONS
+    description: Do not respond when the bot is mentioned alongside other users (mass mention)
+    prompt: Ignore other-user mentions
     password: false
   - name: ROCKETCHAT_ALLOWED_USERS
     description: Comma-separated Rocket.Chat user IDs allowed to talk to Hermes

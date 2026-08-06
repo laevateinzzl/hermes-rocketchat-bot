@@ -4,7 +4,11 @@ import pytest
 import tempfile
 from pathlib import Path
 
-from adapter import standalone_send, RocketChatClient
+from adapter import (
+    RocketChatClient,
+    resolve_delivery_target,
+    standalone_send,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -169,3 +173,125 @@ async def test_standalone_send_media_files_is_callable():
 
     assert isinstance(result, dict)
     assert "success" in result or "error" in result
+
+
+# ---------------------------------------------------------------------------
+# v0.2 P2.3 — user/username target resolution to DM rooms
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_room_id_target_passes_through():
+    """A real room id is used as-is (one rooms.info probe)."""
+    session = FakeUploadSession(
+        responses=[
+            FakeUploadResponse(status=200, json_data={"success": True, "room": {"_id": "room-1"}}),
+        ]
+    )
+    client = FakeUploadClient(session)
+
+    room_id = await resolve_delivery_target(client, "room-1")
+
+    assert room_id == "room-1"
+    assert session.requests[0]["method"] == "GET"
+    assert "rooms.info" in session.requests[0]["url"]
+
+
+@pytest.mark.asyncio
+async def test_user_id_target_resolved_to_dm():
+    """A user id target resolves via users.info -> dm.create."""
+    session = FakeUploadSession(
+        responses=[
+            # rooms.info -> 404 (not a room)
+            FakeUploadResponse(status=404, json_data={"success": False, "error": "room-not-found"}),
+            # users.info(userId) -> username
+            FakeUploadResponse(status=200, json_data={"success": True, "user": {"_id": "u-9", "username": "alice"}}),
+            # dm.create -> room
+            FakeUploadResponse(status=200, json_data={"success": True, "room": {"_id": "dm-9"}}),
+        ]
+    )
+    client = FakeUploadClient(session)
+
+    room_id = await resolve_delivery_target(client, "u-9")
+
+    assert room_id == "dm-9"
+    urls = [r["url"] for r in session.requests]
+    assert any("rooms.info" in u for u in urls)
+    assert any("users.info" in u for u in urls)
+    assert any("dm.create" in u for u in urls)
+
+
+@pytest.mark.asyncio
+async def test_username_target_resolved_to_dm():
+    """A bare username target resolves via users.info(username) -> dm.create."""
+    session = FakeUploadSession(
+        responses=[
+            FakeUploadResponse(status=404, json_data={"success": False, "error": "room-not-found"}),
+            # users.info(userId=alice) -> 404 (it's a username, not an id)
+            FakeUploadResponse(status=404, json_data={"success": False, "error": "user-not-found"}),
+            # users.info(username=alice)
+            FakeUploadResponse(status=200, json_data={"success": True, "user": {"_id": "u-9", "username": "alice"}}),
+            FakeUploadResponse(status=200, json_data={"success": True, "room": {"_id": "dm-9"}}),
+        ]
+    )
+    client = FakeUploadClient(session)
+
+    room_id = await resolve_delivery_target(client, "alice")
+
+    assert room_id == "dm-9"
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_target_falls_back():
+    """When nothing resolves, the original target is returned (post may fail)."""
+    session = FakeUploadSession(
+        responses=[
+            FakeUploadResponse(status=404, json_data={"success": False, "error": "room-not-found"}),
+            FakeUploadResponse(status=404, json_data={"success": False, "error": "user-not-found"}),
+            FakeUploadResponse(status=404, json_data={"success": False, "error": "user-not-found"}),
+        ]
+    )
+    client = FakeUploadClient(session)
+
+    room_id = await resolve_delivery_target(client, "ghost")
+
+    assert room_id == "ghost"
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_resolves_user_target():
+    """standalone_send must deliver to the DM room for a user target."""
+    session = FakeUploadSession(
+        responses=[
+            # client.initialize -> /api/v1/me
+            FakeUploadResponse(status=200, json_data={"success": True, "_id": "bot1", "username": "hermesbot"}),
+            # rooms.info -> 404
+            FakeUploadResponse(status=404, json_data={"success": False, "error": "room-not-found"}),
+            # users.info(userId) -> 404 (username target)
+            FakeUploadResponse(status=404, json_data={"success": False, "error": "user-not-found"}),
+            # users.info(username) -> user
+            FakeUploadResponse(status=200, json_data={"success": True, "user": {"_id": "u-9", "username": "alice"}}),
+            # dm.create -> room
+            FakeUploadResponse(status=200, json_data={"success": True, "room": {"_id": "dm-9"}}),
+            # chat.postMessage to the DM room
+            FakeUploadResponse(status=200, json_data={"success": True, "message": {"_id": "m-1"}}),
+        ]
+    )
+    client = FakeUploadClient(session)
+    # patch the module-level resolver cache so this run is deterministic
+    import adapter as adapter_module
+
+    adapter_module._delivery_room_cache.clear()
+
+    result = await standalone_send(
+        pconfig={"server_url": "https://chat.example.com", "auth_mode": "token",
+                 "user_id": "bot1", "access_token": "tok"},
+        chat_id="alice",
+        message="hello alice",
+        _client_factory=lambda: client,
+    )
+
+    assert result["success"]
+    post = [r for r in session.requests if "chat.postMessage" in r["url"]]
+    assert post
+    assert post[0]["json"]["roomId"] == "dm-9"

@@ -184,6 +184,18 @@ ROCKETCHAT_MENTION_NAMES=hermes,assistant,bot
 The bot responds to `@hermesbot` (its actual username) plus any alias listed
 above.
 
+**Per-room override:** rooms listed in `ROCKETCHAT_ALWAYS_RESPOND_ROOMS`
+(comma-separated room IDs) receive every message without needing a mention
+(mirrors Slack's `require_mention_channels`):
+
+```bash
+ROCKETCHAT_ALWAYS_RESPOND_ROOMS=room-id-a,room-id-b
+```
+
+**Mass mentions:** with `ROCKETCHAT_IGNORE_OTHER_USER_MENTIONS=true`, the bot
+stays quiet when it is mentioned *alongside* other users (a message for
+everyone) and still answers a direct `@hermesbot` mention.
+
 **Direct messages** always reach the bot — no mention required.
 
 ### Thread behaviour
@@ -192,6 +204,9 @@ above.
   triggering message.
 - If the triggering message is already inside a Rocket.Chat thread the reply
   stays in that thread.
+- Thread replies backfill the **parent message context** (text + author) into
+  the Hermes event, so the agent knows what it is replying to; replies to the
+  bot's own messages are flagged.
 - DMs can receive normal (non-threaded) replies.
 
 ### Cron / proactive delivery
@@ -201,6 +216,11 @@ Set a home room for cron-triggered messages:
 ```bash
 ROCKETCHAT_HOME_CHANNEL=GENERAL_ROOM_ID
 ```
+
+A cron target may also be a **Rocket.Chat username or user ID**: the adapter
+resolves it to (or reuses) the user's direct room via `dm.create`, so
+proactive delivery can reach a person directly (mirrors Hermes Slack
+user-to-DM resolution).
 
 ### Optional settings
 

@@ -37,6 +37,8 @@ class RocketChatConfig:
     transport: str = "polling"
     poll_interval_seconds: float = 3.0
     mention_names: list[str] = field(default_factory=list)
+    always_respond_rooms: list[str] = field(default_factory=list)
+    ignore_other_user_mentions: bool = False
     force_thread: bool = False
     home_channel: str = ""
     media_cache_dir: str = ""
@@ -122,6 +124,14 @@ def parse_config(extra: dict[str, Any] | None = None) -> RocketChatConfig:
         ),
         mention_names=_parse_csv(
             extra.get("mention_names") or os.environ.get("ROCKETCHAT_MENTION_NAMES", "")
+        ),
+        always_respond_rooms=_parse_csv(
+            extra.get("always_respond_rooms")
+            or os.environ.get("ROCKETCHAT_ALWAYS_RESPOND_ROOMS", "")
+        ),
+        ignore_other_user_mentions=_parse_bool(
+            extra.get("ignore_other_user_mentions")
+            or os.environ.get("ROCKETCHAT_IGNORE_OTHER_USER_MENTIONS")
         ),
         force_thread=_parse_bool(
             extra.get("force_thread") or os.environ.get("ROCKETCHAT_FORCE_THREAD")
@@ -232,13 +242,25 @@ def env_enablement() -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
+def _mention_username(mention: Any) -> str:
+    """Normalize a Rocket.Chat mention entry to a username string.
+
+    Rocket.Chat delivers ``mentions`` as objects (``{"username": ...}``) in
+    production and as plain strings in some test paths; accept both.
+    """
+    if isinstance(mention, dict):
+        return str(mention.get("username") or mention.get("name") or "")
+    return str(mention)
+
+
 def should_handle_message(
     room_type: str,
     text: str,
-    mentions: list[str],
+    mentions: list[Any],
     bot_user_id: str,
     bot_username: str,
     mention_names: list[str] | None = None,
+    ignore_other_user_mentions: bool = False,
 ) -> bool:
     """Decide whether an inbound Rocket.Chat message should be dispatched to Hermes.
 
@@ -246,6 +268,9 @@ def should_handle_message(
     - Group/channel messages require an explicit mention of the bot username
       or a configured alias, either via Rocket.Chat mention metadata or via
       an @-mention in the message text.
+    - When ``ignore_other_user_mentions`` is set, a message that mentions the
+      bot *alongside* other users is treated as a mass mention and ignored;
+      the bot still responds to a direct @-mention.
     """
     if mention_names is None:
         mention_names = []
@@ -265,10 +290,22 @@ def should_handle_message(
     if not triggers:
         return False
 
-    # Check Rocket.Chat mention metadata (array of usernames)
+    # Check Rocket.Chat mention metadata (array of usernames / user objects)
+    bot_mentioned = False
+    other_mentioned = False
     for m in mentions:
-        if m.strip().lower() in triggers:
-            return True
+        key = _mention_username(m).strip().lower()
+        if not key:
+            continue
+        if key in triggers:
+            bot_mentioned = True
+        else:
+            other_mentioned = True
+
+    if bot_mentioned:
+        if ignore_other_user_mentions and other_mentioned:
+            return False
+        return True
 
     # Check text for @mention patterns
     text_lower = text.lower()
@@ -602,6 +639,66 @@ class RocketChatClient:
             raise RocketChatClientError(f"Update failed: {msg}")
 
         return data.get("message", {})
+
+    async def get_message(self, message_id: str) -> dict:
+        """Fetch a single message via /api/v1/chat.getMessage."""
+        data = await self._request(
+            "GET",
+            "/api/v1/chat.getMessage",
+            params={"msgId": message_id},
+        )
+
+        if not data.get("success", False):
+            msg = data.get("error", "chat.getMessage failed")
+            raise RocketChatClientError(f"Get message failed: {msg}")
+
+        return data.get("message") or {}
+
+    async def room_info(self, room_id: str) -> dict:
+        """Resolve a room by id via /api/v1/rooms.info."""
+        data = await self._request(
+            "GET",
+            "/api/v1/rooms.info",
+            params={"roomId": room_id},
+        )
+        if not data.get("success", False):
+            raise RocketChatClientError(
+                f"rooms.info failed: {data.get('error', 'unknown')}"
+            )
+        return data.get("room") or {}
+
+    async def user_info(self, user_id: str = "", username: str = "") -> dict:
+        """Resolve a user by id or username via /api/v1/users.info."""
+        params: dict[str, str] = {}
+        if user_id:
+            params["userId"] = user_id
+        if username:
+            params["username"] = username
+        data = await self._request("GET", "/api/v1/users.info", params=params)
+        if not data.get("success", False):
+            raise RocketChatClientError(
+                f"users.info failed: {data.get('error', 'unknown')}"
+            )
+        return data.get("user") or {}
+
+    async def create_direct_room(self, usernames: str | list[str]) -> str:
+        """Create or reuse a direct room via /api/v1/dm.create.
+
+        Returns the room id, or an empty string on a non-success response.
+        """
+        if isinstance(usernames, list):
+            usernames = ",".join(usernames)
+        data = await self._request(
+            "POST",
+            "/api/v1/dm.create",
+            json={"usernames": usernames},
+        )
+        if not data.get("success", False):
+            raise RocketChatClientError(
+                f"dm.create failed: {data.get('error', 'unknown')}"
+            )
+        room = data.get("room") or {}
+        return str(room.get("_id") or "")
 
     async def list_subscriptions(self, updated_since=None) -> list[dict]:
         """List subscriptions via /api/v1/subscriptions.get."""
@@ -1234,6 +1331,10 @@ except ImportError:
         media_urls: list[str] = field(default_factory=list)
         media_types: list[str] = field(default_factory=list)
         reply_to_message_id: str = ""
+        reply_to_text: str = ""
+        reply_to_author_id: str = ""
+        reply_to_author_name: str = ""
+        reply_to_is_own_message: bool = False
         raw_payload: dict[str, Any] | None = None
         platform: str = "rocketchat"
 
@@ -1835,6 +1936,9 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         # repeated typing refreshes only edit the placeholder when the live
         # status actually changed.
         self._last_status_text: BoundedDict[str, str] = BoundedDict(maxsize=500)
+        # Thread parent-message cache for reply-context backfill (message id →
+        # normalized context dict), bounded so long-running gateways stay flat.
+        self._reply_cache: BoundedDict[str, dict[str, Any]] = BoundedDict(maxsize=200)
         self._cfg: RocketChatConfig | None = None
         self._seen_id_store: PersistentSeenIdStore | None = None
 
@@ -2002,6 +2106,12 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         """Return the explicit Hermes/Rocket.Chat thread id from metadata."""
         if isinstance(metadata, dict):
             return str(metadata.get("thread_id") or "")
+        return ""
+
+    def _bot_user_id(self) -> str:
+        """Return the authenticated bot user id, or an empty string."""
+        if self._client is not None and self._client.identity is not None:
+            return str(getattr(self._client.identity, "user_id", "") or "")
         return ""
 
     def _typing_placeholder_key(
@@ -2643,19 +2753,30 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
 
         # Mention gating for non-DM rooms
         if chat_type != "dm":
-            mention_names = self._cfg.mention_names if self._cfg else []
-            text = event.get("msg", "")
-            mentions = event.get("mentions", [])
+            # Per-room override: configured rooms respond to every message
+            # without needing a mention (mirrors Slack require_mention_channels).
+            room_id = str(event.get("rid") or "")
+            always_respond = bool(
+                self._cfg and room_id in (self._cfg.always_respond_rooms or [])
+            )
+            if not always_respond:
+                mention_names = self._cfg.mention_names if self._cfg else []
+                ignore_other = bool(
+                    self._cfg and self._cfg.ignore_other_user_mentions
+                )
+                text = event.get("msg", "")
+                mentions = event.get("mentions", [])
 
-            if not should_handle_message(
-                room_type=room_type,
-                text=text,
-                mentions=mentions,
-                bot_user_id=bot_user_id,
-                bot_username=bot_username,
-                mention_names=mention_names,
-            ):
-                return
+                if not should_handle_message(
+                    room_type=room_type,
+                    text=text,
+                    mentions=mentions,
+                    bot_user_id=bot_user_id,
+                    bot_username=bot_username,
+                    mention_names=mention_names,
+                    ignore_other_user_mentions=ignore_other,
+                ):
+                    return
 
         # Resolve attachments
         media_urls: list[str] = []
@@ -2669,6 +2790,12 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
 
         # Determine reply target
         reply_to = event.get("tmid", "")
+
+        # Reply-context backfill: fetch the parent message of a thread reply
+        # (cached per thread) so Hermes gets reply_to_text / author context.
+        reply_context: dict[str, Any] = {}
+        if reply_to:
+            reply_context = await self._get_reply_context(reply_to)
 
         # Build source
         source = self._build_event_source(
@@ -2690,6 +2817,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             media_urls=media_urls,
             media_types=media_types,
             reply_to=reply_to,
+            reply_context=reply_context,
         )
 
         await self.handle_message(message_event)
@@ -2728,6 +2856,31 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 room_name=room_name,
             )
 
+    async def _get_reply_context(self, message_id: str) -> dict[str, Any]:
+        """Fetch (and cache) the parent message context of a thread reply.
+
+        Returns a normalized dict with ``text``, ``author_id`` and
+        ``author_name`` keys, or ``{}`` when the parent is unavailable
+        (deleted, permission denied) — inbound delivery never blocks on it.
+        """
+        if not message_id or self._client is None:
+            return {}
+        cached = self._reply_cache.get(message_id)
+        if cached is not None:
+            return cached
+        try:
+            parent = await self._client.get_message(message_id)
+        except (RocketChatClientError, AttributeError):
+            return {}
+        author = parent.get("u") or {}
+        context = {
+            "text": str(parent.get("msg") or ""),
+            "author_id": str(author.get("_id") or ""),
+            "author_name": str(author.get("username") or ""),
+        }
+        self._reply_cache[message_id] = context
+        return context
+
     def _build_message_event(
         self,
         source: Any,
@@ -2736,8 +2889,10 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         media_urls: list[str],
         media_types: list[str],
         reply_to: str,
+        reply_context: dict[str, Any] | None = None,
     ) -> MessageEvent:
         """Build a MessageEvent for both current Hermes and local stubs."""
+        ctx = reply_context or {}
         if isinstance(source, dict):
             return MessageEvent(
                 chat_id=source["chat_id"],
@@ -2748,11 +2903,18 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 media_urls=media_urls,
                 media_types=media_types,
                 reply_to_message_id=reply_to,
+                reply_to_text=ctx.get("text", ""),
+                reply_to_author_id=ctx.get("author_id", ""),
+                reply_to_author_name=ctx.get("author_name", ""),
+                reply_to_is_own_message=bool(
+                    ctx.get("author_id") and ctx.get("author_id") == self._bot_user_id()
+                ),
                 raw_payload=raw_event,
                 platform="rocketchat",
             )
 
         message_event_cls: Any = MessageEvent
+        ctx = reply_context or {}
         message_event = message_event_cls(
             text=text,
             message_type=self._message_type_for_media(media_types),
@@ -2762,6 +2924,12 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             media_urls=media_urls,
             media_types=media_types,
             reply_to_message_id=reply_to,
+            reply_to_text=ctx.get("text", ""),
+            reply_to_author_id=ctx.get("author_id", ""),
+            reply_to_author_name=ctx.get("author_name", ""),
+            reply_to_is_own_message=bool(
+                ctx.get("author_id") and ctx.get("author_id") == self._bot_user_id()
+            ),
         )
 
         # Compatibility for tests and older call sites that read flattened
@@ -2868,11 +3036,70 @@ def _rc_room_type_to_chat_type(room_type: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Delivery-target resolution cache for standalone sends (target → room id).
+# Bounded so a long-lived process (gateway) stays flat.
+_delivery_room_cache: BoundedDict[str, str] = BoundedDict(maxsize=200)
+
+
+async def resolve_delivery_target(client: Any, target: str) -> str:
+    """Resolve a standalone delivery target to a Rocket.Chat room id.
+
+    A real room id passes through untouched (one ``rooms.info`` probe).
+    Otherwise the target is treated as a user id or username: resolved via
+    ``users.info`` and delivered to the direct room from ``dm.create`` —
+    mirrors Hermes' Slack fix c7b9dfa96 (resolve user IDs to DM channels in
+    standalone cron delivery).  When nothing resolves, the original target is
+    returned so the caller's send fails with a clear platform error.
+    """
+    target = str(target or "")
+    if not target:
+        return target
+
+    cached = _delivery_room_cache.get(target)
+    if cached is not None:
+        return cached
+
+    # 1. Already a room id?
+    try:
+        room = await client.room_info(target)
+        if room.get("_id"):
+            _delivery_room_cache[target] = target
+            return target
+    except RocketChatClientError:
+        pass
+
+    # 2. A user id, then a username → direct room.
+    username = ""
+    try:
+        user = await client.user_info(user_id=target)
+        username = str(user.get("username") or "")
+    except RocketChatClientError:
+        pass
+    if not username:
+        try:
+            user = await client.user_info(username=target)
+            username = str(user.get("username") or "")
+        except RocketChatClientError:
+            pass
+
+    if username:
+        try:
+            room_id = await client.create_direct_room(username)
+            if room_id:
+                _delivery_room_cache[target] = room_id
+                return room_id
+        except RocketChatClientError:
+            pass
+
+    return target
+
+
 async def standalone_send(
     pconfig: dict[str, Any],
     chat_id: str,
     message: str,
     media_files: list[str] | None = None,
+    _client_factory: Any = None,
 ) -> dict[str, Any]:
     """Send a message from a standalone context (cron job, external trigger).
 
@@ -2902,14 +3129,21 @@ async def standalone_send(
     try:
         cfg = parse_config(pconfig)
 
-        client = RocketChatClient(
-            server_url=cfg.server_url,
-            user_id=cfg.user_id,
-            access_token=cfg.access_token,
-            username=cfg.username,
-            password=cfg.password,
-        )
+        if _client_factory is not None:
+            client: Any = _client_factory()
+        else:
+            client = RocketChatClient(
+                server_url=cfg.server_url,
+                user_id=cfg.user_id,
+                access_token=cfg.access_token,
+                username=cfg.username,
+                password=cfg.password,
+            )
         await client.initialize()
+
+        # Resolve the delivery target to a room id: room ids pass through;
+        # user ids / usernames resolve to a direct room (dm.create).
+        room_id = await resolve_delivery_target(client, chat_id)
 
         message_id = ""
 
@@ -2918,7 +3152,7 @@ async def standalone_send(
             for file_path in media_files:
                 upload_attachment: Any = getattr(client, "upload_attachment")
                 uploaded = await upload_attachment(
-                    room_id=chat_id,
+                    room_id=room_id,
                     file_path=file_path,
                     text=message,
                 )
@@ -2926,7 +3160,7 @@ async def standalone_send(
 
         # Post text message (even when media was uploaded — may serve as caption)
         if message:
-            result = await client.post_message(room_id=chat_id, text=message)
+            result = await client.post_message(room_id=room_id, text=message)
             message_id = result.get("_id", message_id)
 
         return {"success": True, "message_id": message_id}
