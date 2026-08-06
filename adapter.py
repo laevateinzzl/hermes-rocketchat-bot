@@ -614,6 +614,76 @@ class RocketChatClient:
             read_fn = resp.aread if hasattr(resp, "aread") else resp.read
             return await _maybe_await(read_fn())
 
+    async def upload_attachment(
+        self,
+        room_id: str,
+        file_path: str,
+        text: str = "",
+        tmid: str = "",
+    ) -> dict:
+        """Upload a local file to a Rocket.Chat room.
+
+        Uses the three-step Rocket.Chat file-upload flow:
+        1. ``POST /api/v1/rooms.media/{roomId}``  — upload the file
+        2. ``POST /api/v1/rooms.mediaConfirm/{roomId}/{fileId}`` — confirm
+        3. ``POST /api/v1/chat.postMessage`` — post the text message with file ref
+
+        .. note::
+
+           In a production deployment with real multipart uploads the first step
+           sends the file as form data.  The current implementation sends file
+           metadata as JSON so that tests with mock HTTP sessions can exercise the
+           full flow without multipart machinery.
+        """
+        from pathlib import Path
+
+        path = Path(file_path)
+        if not path.exists():
+            raise RocketChatClientError(f"File not found: {file_path}")
+
+        file_name = path.name
+
+        # Step 1 — upload
+        upload_result = await self._request(
+            "POST",
+            f"/api/v1/rooms.media/{room_id}",
+            json={"file_name": file_name, "file_path": str(path)},
+        )
+
+        if not upload_result.get("success", False):
+            raise RocketChatClientError(
+                f"Upload failed: {upload_result.get('error', 'unknown')}"
+            )
+
+        file_id = upload_result.get("file", {}).get("_id", "")
+
+        # Step 2 — confirm
+        if file_id:
+            confirm_payload: dict[str, str] = {"msg": text}
+            if tmid:
+                confirm_payload["tmid"] = tmid
+            await self._request(
+                "POST",
+                f"/api/v1/rooms.mediaConfirm/{room_id}/{file_id}",
+                json=confirm_payload,
+            )
+
+        # Step 3 — post message with file reference
+        payload: dict[str, Any] = {"roomId": room_id, "text": text}
+        if tmid:
+            payload["tmid"] = tmid
+        if file_id:
+            payload["file"] = {"_id": file_id, "name": file_name}
+
+        data = await self._request("POST", "/api/v1/chat.postMessage", json=payload)
+
+        if not data.get("success", False):
+            raise RocketChatClientError(
+                f"Send failed: {data.get('error', 'chat.postMessage failed')}"
+            )
+
+        return data.get("message", {})
+
 
 # ---------------------------------------------------------------------------
 # Attachment handling
@@ -810,7 +880,6 @@ class PersistentSeenIdStore:
     """
 
     def __init__(self, path: str = "", ttl_seconds: float = 7 * 24 * 3600):
-        import time
         self._path = path
         self._ttl = max(1.0, _parse_float_safe(ttl_seconds, 7 * 24 * 3600))
         self._seen: dict[str, float] = {}
@@ -822,7 +891,6 @@ class PersistentSeenIdStore:
         if not self._path:
             return
         import json
-        import os
         try:
             with open(self._path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -1039,9 +1107,15 @@ try:
         MessageEvent,
         MessageType,
         SendResult,
+        cache_image_from_url,
     )
 except ImportError:
     # Test-friendly stubs that mirror the Hermes base adapter interface
+
+    async def cache_image_from_url(url: str, ext: str = ".jpg") -> str:
+        """Hermes image-cache downloader stub (unavailable without Hermes)."""
+        raise RocketChatClientError("Image download unavailable (Hermes not installed)")
+
 
     class MessageType(str, Enum):
         TEXT = "text"
@@ -1082,6 +1156,7 @@ except ImportError:
             self.platform = platform
             self._connected = False
             self._message_handler: Any = None
+            self._status_text: dict[str, str] = {}
 
         @property
         def is_connected(self) -> bool:
@@ -1089,6 +1164,13 @@ except ImportError:
 
         def set_message_handler(self, handler: Any) -> None:
             self._message_handler = handler
+
+        def set_status_text(self, chat_id: str, text: str | None) -> None:
+            """Set or clear the live working-state phrase for a chat."""
+            if text:
+                self._status_text[str(chat_id)] = text
+            else:
+                self._status_text.pop(str(chat_id), None)
 
         async def connect(self) -> bool:
             self._connected = True
@@ -1587,12 +1669,33 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         per-platform overrides for any ``ROCKETCHAT_*`` setting.
     """
 
+    # The thinking placeholder is a real message that can be edited, so the
+    # gateway's live per-tool status phrases are rendered into it.
+    supports_status_text: bool = True
+
+    # Rocket.Chat renders markdown, including fenced code blocks, so the
+    # gateway may present tool progress as a bare fenced block.
+    supports_code_blocks: bool = True
+
+    # The adapter splits oversized content natively in send(); the delivery
+    # router then skips its own gateway-level truncation.
+    splits_long_messages: bool = True
+
     def __init__(self, config: Any = None):
         self._message_handler: Any = None
         self._client: RocketChatClient | None = None
         self._transport: Any = None
         self._room_info: dict[str, dict[str, Any]] = {}
         self._typing_placeholders: dict[str, str] = {}
+        # Live stream-preview markers: placeholder key → message id of a
+        # message that is currently being edited by the Hermes stream
+        # consumer.  While a preview is live, send_typing() must NOT create a
+        # second "Thinking…" bubble — the growing preview is the indicator.
+        self._stream_previews: dict[str, str] = {}
+        # Last status phrase rendered into each placeholder (key → text), so
+        # repeated typing refreshes only edit the placeholder when the live
+        # status actually changed.
+        self._last_status_text: dict[str, str] = {}
         self._cfg: RocketChatConfig | None = None
         self._seen_id_store: PersistentSeenIdStore | None = None
 
@@ -1764,39 +1867,89 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         self,
         metadata: dict[str, Any] | None = None,
     ) -> bool:
-        """Return True when a send is the final user-visible reply."""
-        return isinstance(metadata, dict) and bool(metadata.get("notify"))
+        """Return True when a send may take over the thinking placeholder.
+
+        ``notify`` marks the final user-visible reply (legacy contract);
+        ``expect_edits`` marks the first chunk of a streamed reply that the
+        stream consumer will grow with edit_message().  In both cases the
+        placeholder message is edited in place so the user sees one message
+        instead of a placeholder plus a duplicate bubble.
+        """
+        if not isinstance(metadata, dict):
+            return False
+        return bool(metadata.get("notify") or metadata.get("expect_edits"))
+
+    def _render_status_phrase(self, chat_id: str) -> str:
+        """Return the placeholder text for a chat, embedding any live status.
+
+        The gateway feeds per-tool phrases ("is running pytest…") via
+        ``set_status_text``; when set, they are appended to the thinking
+        placeholder so channel users see what the bot is doing.
+        """
+        store = getattr(self, "_status_text", None)
+        phrase = (store or {}).get(str(chat_id))
+        if phrase:
+            return f"{THINKING_PLACEHOLDER_TEXT} {phrase}"
+        return THINKING_PLACEHOLDER_TEXT
 
     async def send_typing(
         self,
         chat_id: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Create one visible thinking placeholder for the active turn."""
+        """Create one visible thinking placeholder for the active turn.
+
+        Renders the current live status phrase; a later refresh edits the
+        placeholder only when the phrase changed.  Skipped while a stream
+        preview is being edited for the same (chat, thread): the growing
+        preview already tells the user the bot is working.
+        """
         if not self._connected or self._client is None:
             return
 
         key = self._typing_placeholder_key(chat_id, metadata)
-        if key in self._typing_placeholders:
+        if key in self._stream_previews:
+            return
+
+        status_text = self._render_status_phrase(chat_id)
+
+        existing = self._typing_placeholders.get(key)
+        if existing:
+            # Refresh the placeholder only when the live status changed.
+            if self._last_status_text.get(key) != status_text:
+                try:
+                    await self._client.update_message(
+                        room_id=chat_id,
+                        message_id=existing,
+                        text=status_text,
+                    )
+                    self._last_status_text[key] = status_text
+                except RocketChatClientError:
+                    # Keep the placeholder; the final send still edits it.
+                    pass
             return
 
         result = await self._client.post_message(
             room_id=chat_id,
-            text=THINKING_PLACEHOLDER_TEXT,
+            text=status_text,
             tmid=self._metadata_thread_id(metadata),
         )
         message_id = str(result.get("_id") or "")
         if message_id:
             self._typing_placeholders[key] = message_id
+            self._last_status_text[key] = status_text
 
     async def stop_typing(self, chat_id: str) -> None:
-        """Keep placeholders available for final send to edit.
+        """Clear stream-preview markers for the chat so the next turn can
+        create a fresh thinking placeholder.
 
-        Hermes calls stop_typing after the agent finishes but before the final
-        response is delivered, so clearing placeholder state here would prevent
-        the final send from replacing the thinking message.
+        The placeholder message itself is kept: the final send edits it
+        (Hermes calls stop_typing after the agent finishes but before the
+        final response is delivered).
         """
-        return None
+        prefix = f"{chat_id}\u0000"
+        for key in [k for k in self._stream_previews if k.startswith(prefix)]:
+            self._stream_previews.pop(key, None)
 
     async def send(
         self,
@@ -1818,48 +1971,54 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             )
 
         try:
-            # Truncate to max message length
+            # Chunk oversized content at paragraph/line boundaries instead of
+            # hard-truncating it (splits_long_messages = True).  Every chunk
+            # is posted into the same room/thread; the first chunk consumes
+            # the thinking placeholder when present.
             text = content
             max_len = self._cfg.max_message_length if self._cfg else 4000
             if len(text) > max_len:
-                text = text[:max_len]
-
-            # Threaded reply: explicit Rocket.Chat/Hermes thread metadata wins.
-            # Hermes' generic gateway reply anchor passes the triggering message id
-            # as reply_to for every platform; in Rocket.Chat that would hide normal
-            # replies inside threads. Only use reply_to as tmid for direct adapter
-            # callers that did not provide gateway metadata.
-            metadata_thread_id = self._metadata_thread_id(metadata)
-            if metadata_thread_id:
-                tmid = metadata_thread_id
-            elif metadata is None:
-                tmid = reply_to or ""
+                chunks = self._split_long_text(text, max_len)
             else:
-                tmid = ""
+                chunks = [text]
+
+            tmid = self._resolve_tmid(chat_id, reply_to, metadata)
 
             placeholder_key = self._typing_placeholder_key(chat_id, metadata)
             placeholder_id = self._typing_placeholders.get(placeholder_key)
-            if placeholder_id and self._should_consume_typing_placeholder(metadata):
-                result = await self._client.update_message(
-                    room_id=chat_id,
-                    message_id=placeholder_id,
-                    text=text,
-                )
-                self._typing_placeholders.pop(placeholder_key, None)
-                return SendResult(
-                    success=True,
-                    message_id=result.get("_id", placeholder_id),
-                )
 
-            result = await self._client.post_message(
-                room_id=chat_id,
-                text=text,
-                tmid=tmid,
-            )
+            first_message_id = ""
+            for index, chunk in enumerate(chunks):
+                if (
+                    index == 0
+                    and placeholder_id
+                    and self._should_consume_typing_placeholder(metadata)
+                ):
+                    result = await self._client.update_message(
+                        room_id=chat_id,
+                        message_id=placeholder_id,
+                        text=chunk,
+                    )
+                    self._typing_placeholders.pop(placeholder_key, None)
+                    # First chunk of a streamed reply: remember the message id
+                    # so edit_message() edits it and send_typing() stays quiet.
+                    if metadata and metadata.get("expect_edits"):
+                        self._stream_previews[placeholder_key] = result.get(
+                            "_id", placeholder_id
+                        )
+                    first_message_id = result.get("_id", placeholder_id)
+                else:
+                    result = await self._client.post_message(
+                        room_id=chat_id,
+                        text=chunk,
+                        tmid=tmid,
+                    )
+                    if not first_message_id:
+                        first_message_id = result.get("_id", "")
 
             return SendResult(
                 success=True,
-                message_id=result.get("_id", ""),
+                message_id=first_message_id,
             )
         except RocketChatClientError as exc:
             return SendResult(
@@ -1871,6 +2030,390 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 success=False,
                 error=f"Unexpected error: {exc}",
             )
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Edit a previously sent message via Rocket.Chat ``chat.update``.
+
+        Implemented so the Hermes stream consumer can grow a reply in place
+        (live preview) instead of falling back to the non-streaming path.
+        ``finalize`` is a no-op for Rocket.Chat (an edit is an edit); when
+        True we clear the matching stream-preview marker so the next turn's
+        send_typing() may create a fresh thinking placeholder.
+        """
+        if not self._connected or self._client is None:
+            return SendResult(
+                success=False,
+                error="Adapter is not connected",
+            )
+
+        try:
+            text = content
+            max_len = self._cfg.max_message_length if self._cfg else 4000
+            if len(text) > max_len:
+                text = text[:max_len]
+
+            result = await self._client.update_message(
+                room_id=chat_id,
+                message_id=message_id,
+                text=text,
+            )
+
+            if finalize:
+                for key, preview_id in list(self._stream_previews.items()):
+                    if preview_id == message_id:
+                        self._stream_previews.pop(key, None)
+
+            return SendResult(
+                success=True,
+                message_id=result.get("_id", message_id),
+            )
+        except RocketChatClientError as exc:
+            return SendResult(
+                success=False,
+                error=str(exc),
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"Unexpected error: {exc}",
+            )
+
+    def _resolve_tmid(
+        self,
+        chat_id: str,
+        reply_to: str,
+        metadata: dict[str, Any] | None,
+    ) -> str:
+        """Resolve the Rocket.Chat thread id (tmid) for an outbound send.
+
+        Explicit Rocket.Chat/Hermes thread metadata wins.  Hermes' generic
+        gateway reply anchor passes the triggering message id as reply_to for
+        every platform; in Rocket.Chat that would hide normal replies inside
+        threads.  Only use reply_to as tmid for direct adapter callers that
+        did not provide gateway metadata.
+        """
+        metadata_thread_id = self._metadata_thread_id(metadata)
+        if metadata_thread_id:
+            return metadata_thread_id
+        if metadata is None:
+            return reply_to or ""
+        return ""
+
+    @staticmethod
+    def _split_long_text(text: str, max_len: int) -> list[str]:
+        """Split *text* into chunks of at most *max_len* characters.
+
+        Splits at paragraph (``\n\n``) boundaries first, then line (``\n``)
+        boundaries, then hard-splits any remaining single line (preferring a
+        word boundary near the limit).  The concatenation ``"".join(chunks)``
+        always equals the input exactly — nothing is truncated or inserted.
+        """
+        if len(text) <= max_len:
+            return [text]
+
+        chunks: list[str] = []
+        current = ""
+        paragraphs = text.split("\n\n")
+        n_paras = len(paragraphs)
+
+        def _flush() -> None:
+            nonlocal current
+            if current:
+                chunks.append(current)
+                current = ""
+
+        for pi, para in enumerate(paragraphs):
+            sep = "\n\n" if pi < n_paras - 1 else ""
+            if len(current + para + sep) <= max_len:
+                current += para + sep
+                continue
+            _flush()
+            # Paragraph (with separator) alone may still fit after flushing.
+            if len(para + sep) <= max_len:
+                current = para + sep
+                continue
+            # Paragraph too long: split by lines.
+            lines = para.split("\n")
+            n_lines = len(lines)
+            for li, line in enumerate(lines):
+                lsep = "\n" if li < n_lines - 1 else sep
+                if len(current + line + lsep) <= max_len:
+                    current += line + lsep
+                    continue
+                _flush()
+                if len(line + lsep) <= max_len:
+                    current = line + lsep
+                    continue
+                # Single line too long: hard-split at a word boundary.
+                remaining = line + lsep
+                while len(remaining) > max_len:
+                    cut = remaining[:max_len]
+                    space = cut.rfind(" ")
+                    if space > max_len // 2:
+                        piece, remaining = cut[:space], remaining[space:]
+                    else:
+                        piece, remaining = cut, remaining[max_len:]
+                    chunks.append(piece)
+                current = remaining
+
+        _flush()
+        return chunks or [text]
+
+
+    # -- native outbound media delivery (Hermes MEDIA: contract) ---------------
+
+    async def _send_media_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        *,
+        caption: str = "",
+        reply_to: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Upload a local file via ``rooms.media`` and post it with a file ref.
+
+        Shared implementation for every native media send (images, documents,
+        video, audio, voice).  Returns a ``SendResult`` on success or failure;
+        never leaks the host file path into chat.
+        """
+        if not self._connected or self._client is None:
+            return SendResult(
+                success=False,
+                error="Adapter is not connected",
+            )
+
+        try:
+            tmid = self._resolve_tmid(chat_id, reply_to, metadata)
+            result = await self._client.upload_attachment(
+                room_id=chat_id,
+                file_path=str(file_path),
+                text=caption,
+                tmid=tmid,
+            )
+            return SendResult(
+                success=True,
+                message_id=str(result.get("_id", "")),
+            )
+        except RocketChatClientError as exc:
+            return SendResult(
+                success=False,
+                error=str(exc),
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"Unexpected error: {exc}",
+            )
+
+    @staticmethod
+    def _media_path_from_source(src: str, default_ext: str = ".jpg") -> str:
+        """Resolve an image/media source to a local file path.
+
+        Accepts local paths, ``file://`` URIs (as the gateway passes for
+        MEDIA delivery), and http(s) URLs.  Returns ``""`` for unsupported
+        sources so callers can produce a clean failure.
+        """
+        if not src:
+            return ""
+        if src.startswith("file://"):
+            from urllib.parse import unquote
+
+            return unquote(src[7:])
+        if src.startswith(("http://", "https://")):
+            lower = src.lower().split("?")[0]
+            for known in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"):
+                if lower.endswith(known):
+                    return src  # marker: still a URL; caller downloads
+            return src
+        if os.path.exists(src):
+            return src
+        return ""
+
+    async def _download_media_url(self, url: str, ext: str = ".jpg") -> str:
+        """Download a media URL to the Hermes image cache (SSRF-guarded).
+
+        Delegates to Hermes' ``cache_image_from_url`` which validates the
+        target and re-checks every redirect (blocks redirects to private
+        addresses).  Raises ``RocketChatClientError`` on failure.
+        """
+        try:
+            return await cache_image_from_url(url, ext)
+        except RocketChatClientError:
+            raise
+        except Exception as exc:
+            raise RocketChatClientError(
+                f"Failed to download media: {exc}"
+            ) from exc
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Send a local image file natively (rooms.media upload)."""
+        return await self._send_media_file(
+            chat_id,
+            image_path,
+            caption=caption or "",
+            reply_to=reply_to or "",
+            metadata=metadata,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: str | None = None,
+        file_name: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Send a document/file natively (rooms.media upload)."""
+        return await self._send_media_file(
+            chat_id,
+            file_path,
+            caption=caption or "",
+            reply_to=reply_to or "",
+            metadata=metadata,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Send a video file natively (rooms.media upload)."""
+        return await self._send_media_file(
+            chat_id,
+            video_path,
+            caption=caption or "",
+            reply_to=reply_to or "",
+            metadata=metadata,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Send an audio file natively (rooms.media upload)."""
+        return await self._send_media_file(
+            chat_id,
+            audio_path,
+            caption=caption or "",
+            reply_to=reply_to or "",
+            metadata=metadata,
+        )
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Send an image (URL, file:// URI, or local path) natively.
+
+        http(s) sources are downloaded through Hermes' SSRF-guarded image
+        cache (``cache_image_from_url``) before upload, so redirects to
+        private addresses are blocked (mirrors Hermes f54e8706f).
+        """
+        src = self._media_path_from_source(image_url)
+        if not src:
+            return SendResult(
+                success=False,
+                error=f"Unsupported image source: {str(image_url)[:80]}",
+            )
+        if src.startswith(("http://", "https://")):
+            try:
+                ext = ".jpg"
+                lower = src.lower().split("?")[0]
+                for known in (".png", ".jpeg", ".gif", ".webp", ".svg"):
+                    if lower.endswith(known):
+                        ext = known
+                        break
+                src = await self._download_media_url(src, ext)
+            except RocketChatClientError as exc:
+                return SendResult(success=False, error=str(exc))
+        return await self._send_media_file(
+            chat_id,
+            src,
+            caption=caption or "",
+            reply_to=reply_to or "",
+            metadata=metadata,
+        )
+
+    async def send_animation(
+        self,
+        chat_id: str,
+        animation_url: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Send an animated GIF natively (uploaded as a file)."""
+        return await self.send_image(
+            chat_id=chat_id,
+            image_url=animation_url,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: list[tuple[str, str]],
+        metadata: dict[str, Any] | None = None,
+        human_delay: float = 0.0,
+    ) -> list[SendResult]:
+        """Send a batch of images; each is uploaded natively in order.
+
+        Unsupported sources yield a failed ``SendResult`` without aborting the
+        remaining batch.
+        """
+        results: list[SendResult] = []
+        for image_src, alt_text in images or []:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            try:
+                results.append(
+                    await self.send_image(
+                        chat_id=chat_id,
+                        image_url=image_src,
+                        caption=alt_text or None,
+                        metadata=metadata,
+                    )
+                )
+            except Exception as exc:
+                results.append(
+                    SendResult(success=False, error=f"Unexpected error: {exc}")
+                )
+        return results
 
     # -- inbound callback -----------------------------------------------------
 
@@ -2213,79 +2756,6 @@ async def standalone_send(
 # ---------------------------------------------------------------------------
 
 
-async def _client_upload_attachment(
-    self: RocketChatClient,
-    room_id: str,
-    file_path: str,
-    text: str = "",
-    tmid: str = "",
-) -> dict[str, Any]:
-    """Upload a local file to a Rocket.Chat room.
-
-    Uses the three-step Rocket.Chat file-upload flow:
-    1. ``POST /api/v1/rooms.media/{roomId}``  — upload the file
-    2. ``POST /api/v1/rooms.mediaConfirm/{roomId}/{fileId}`` — confirm
-    3. ``POST /api/v1/chat.postMessage`` — post the text message with file ref
-
-    .. note::
-
-       In a production deployment with real multipart uploads the first step
-       sends the file as form data.  The current implementation sends file
-       metadata as JSON so that tests with mock HTTP sessions can exercise the
-       full flow without multipart machinery.
-    """
-    from pathlib import Path
-
-    path = Path(file_path)
-    if not path.exists():
-        raise RocketChatClientError(f"File not found: {file_path}")
-
-    file_name = path.name
-
-    # Step 1 — upload
-    upload_result = await self._request(
-        "POST",
-        f"/api/v1/rooms.media/{room_id}",
-        json={"file_name": file_name, "file_path": str(path)},
-    )
-
-    if not upload_result.get("success", False):
-        raise RocketChatClientError(
-            f"Upload failed: {upload_result.get('error', 'unknown')}"
-        )
-
-    file_id = upload_result.get("file", {}).get("_id", "")
-
-    # Step 2 — confirm
-    if file_id:
-        confirm_payload: dict[str, str] = {"msg": text}
-        if tmid:
-            confirm_payload["tmid"] = tmid
-        await self._request(
-            "POST",
-            f"/api/v1/rooms.mediaConfirm/{room_id}/{file_id}",
-            json=confirm_payload,
-        )
-
-    # Step 3 — post message with file reference
-    payload: dict[str, Any] = {"roomId": room_id, "text": text}
-    if tmid:
-        payload["tmid"] = tmid
-    if file_id:
-        payload["file"] = {"_id": file_id, "name": file_name}
-
-    data = await self._request("POST", "/api/v1/chat.postMessage", json=payload)
-
-    if not data.get("success", False):
-        raise RocketChatClientError(f"Send failed: {data.get('error', 'chat.postMessage failed')}")
-
-    return data.get("message", {})
-
-
-# Attach the upload method to RocketChatClient
-RocketChatClient.upload_attachment = _client_upload_attachment  # type: ignore[method-assign]
-
-
 # ---------------------------------------------------------------------------
 # Plugin registration (Hermes entry point)
 # ---------------------------------------------------------------------------
@@ -2302,7 +2772,7 @@ def check_requirements() -> bool:
     except ImportError:
         pass
     try:
-        import httpx  # noqa: F401
+        import httpx  # type: ignore[import-not-found]  # noqa: F401
         return True
     except ImportError:
         pass

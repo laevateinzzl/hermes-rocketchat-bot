@@ -207,8 +207,26 @@ ROCKETCHAT_HOME_CHANNEL=GENERAL_ROOM_ID
 ```bash
 ROCKETCHAT_FORCE_THREAD=true          # always reply in threads
 ROCKETCHAT_MEDIA_CACHE_DIR=/var/lib/hermes/rocketchat-media
-ROCKETCHAT_MAX_MESSAGE_LENGTH=4000    # truncate long messages
+ROCKETCHAT_MAX_MESSAGE_LENGTH=4000    # max chars per message (longer replies are split)
 ```
+
+## Live streaming, tool status & long replies
+
+- **Streaming previews** — the adapter implements `edit_message`, so Hermes'
+  stream consumer grows replies in real time (one message that fills up as
+  the agent writes) instead of waiting for the whole answer. The 💭 thinking
+  placeholder becomes the first editable preview, so users never see a
+  placeholder *and* a duplicate reply.
+- **Live tool status** — `supports_status_text` is enabled: while the agent
+  runs tools, the thinking placeholder shows the current activity
+  ("💭 Thinking… is running pytest…") and updates as the tool changes.
+- **Long replies are split, not truncated** — `splits_long_messages` is
+  enabled and `send()` chunks oversized content at paragraph/line boundaries
+  into multiple messages in the same room/thread (each ≤
+  `ROCKETCHAT_MAX_MESSAGE_LENGTH`). The delivery router therefore delivers
+  full output without gateway-level truncation.
+- **Code blocks** — `supports_code_blocks` is enabled; Rocket.Chat renders
+  markdown fenced code blocks natively.
 
 ## Running
 
@@ -236,8 +254,18 @@ credentials are present in the environment.
 
 ### Outbound
 
-When Hermes calls the adapter with `media_files`, each file is uploaded to
-Rocket.Chat via the `rooms.media` → `rooms.mediaConfirm` flow.
+Hermes' `MEDIA:` delivery contract is fully supported: every outbound media
+send (`send_image_file`, `send_document`, `send_video`, `send_voice`,
+`send_animation`, and batched `send_multiple_images`) uploads the file to
+Rocket.Chat via the `rooms.media` → `rooms.mediaConfirm` → `chat.postMessage`
+flow, so file attachments from the agent arrive as real downloads — no
+"couldn't deliver" fallbacks.
+
+- Local files, `file://` URIs (what the gateway passes for MEDIA delivery),
+  and http(s) image URLs are all accepted.
+- http(s) images are downloaded through Hermes' SSRF-guarded image cache
+  before upload, so redirects to private/internal addresses are blocked.
+- Thread metadata (`tmid`) is forwarded with every media message.
 
 ## Development
 

@@ -1,0 +1,314 @@
+"""Tests for native outbound media delivery (v0.2 P0.1).
+
+Hermes' post-stream media delivery routes MEDIA files through
+``send_image_file`` / ``send_document`` / ``send_video`` / ``send_voice`` /
+``send_animation`` / ``send_multiple_images``.  The Rocket.Chat adapter must
+override those with a native ``rooms.media`` upload instead of the base
+"couldn't deliver" fallback.
+"""
+
+import tempfile
+from pathlib import Path
+
+import pytest  # type: ignore[reportMissingImports]
+
+from adapter import RocketChatAdapter, RocketChatConfig, RocketChatClientError
+
+
+class FakeUploadClient:
+    """Fake client recording upload_attachment / post_message calls."""
+
+    def __init__(self):
+        self.uploads: list[dict] = []
+        self.identity = None
+        self._upload_counter = 0
+
+    async def upload_attachment(self, room_id, file_path, text="", tmid=""):
+        self._upload_counter += 1
+        call = {
+            "room_id": room_id,
+            "file_path": str(file_path),
+            "text": text,
+            "tmid": tmid,
+        }
+        self.uploads.append(call)
+        return {"_id": f"media-{self._upload_counter}", "file": {"_id": f"f{self._upload_counter}"}}
+
+    @property
+    def server_url(self):
+        return "https://chat.example.com"
+
+
+class FailingUploadClient(FakeUploadClient):
+    """Client whose upload always fails."""
+
+    async def upload_attachment(self, room_id, file_path, text="", tmid=""):
+        raise RocketChatClientError("Upload failed: permission denied")
+
+
+def _make_adapter(client=None, connected=True) -> RocketChatAdapter:
+    adapter = RocketChatAdapter(RocketChatConfig(server_url="https://chat.example.com"))
+    setattr(adapter, "_client", client or FakeUploadClient())
+    adapter._connected = connected
+    return adapter
+
+
+@pytest.fixture
+def media_file():
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp.write(b"fake-image-data")
+        path = tmp.name
+    yield path
+    Path(path).unlink(missing_ok=True)
+
+
+@pytest.fixture
+def doc_file():
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(b"%PDF-fake")
+        path = tmp.name
+    yield path
+    Path(path).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# send_image_file / send_document / send_video / send_voice
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_image_file_uploads_natively(media_file):
+    """send_image_file must upload the local file instead of a fallback notice."""
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    result = await adapter.send_image_file(
+        chat_id="room-1",
+        image_path=media_file,
+        caption="a picture",
+    )
+
+    assert result.success
+    assert result.message_id == "media-1"
+    assert client.uploads == [
+        {
+            "room_id": "room-1",
+            "file_path": media_file,
+            "text": "a picture",
+            "tmid": "",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_document_uploads_natively(doc_file):
+    """send_document must upload the file with its caption as text."""
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    result = await adapter.send_document(
+        chat_id="room-1",
+        file_path=doc_file,
+        caption="report",
+        file_name="report.pdf",
+    )
+
+    assert result.success
+    assert client.uploads[0]["file_path"] == doc_file
+    assert client.uploads[0]["text"] == "report"
+
+
+@pytest.mark.asyncio
+async def test_send_video_uploads_natively(media_file):
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    result = await adapter.send_video(chat_id="room-1", video_path=media_file)
+
+    assert result.success
+    assert client.uploads[0]["file_path"] == media_file
+
+
+@pytest.mark.asyncio
+async def test_send_voice_uploads_natively(media_file):
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    result = await adapter.send_voice(chat_id="room-1", audio_path=media_file)
+
+    assert result.success
+    assert client.uploads[0]["file_path"] == media_file
+
+
+@pytest.mark.asyncio
+async def test_media_send_respects_thread_metadata(media_file):
+    """metadata thread_id must be forwarded to the upload (tmid)."""
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    result = await adapter.send_image_file(
+        chat_id="room-1",
+        image_path=media_file,
+        metadata={"thread_id": "thread-9"},
+    )
+
+    assert result.success
+    assert client.uploads[0]["tmid"] == "thread-9"
+
+
+@pytest.mark.asyncio
+async def test_media_send_returns_failure_when_not_connected(media_file):
+    adapter = _make_adapter(connected=False)
+
+    result = await adapter.send_image_file(chat_id="room-1", image_path=media_file)
+
+    assert not result.success
+    assert result.error
+
+
+@pytest.mark.asyncio
+async def test_media_send_surfaces_upload_error(media_file):
+    client = FailingUploadClient()
+    adapter = _make_adapter(client)
+
+    result = await adapter.send_document(chat_id="room-1", file_path=media_file)
+
+    assert not result.success
+    assert "Upload failed" in result.error
+
+
+# ---------------------------------------------------------------------------
+# send_image (URL) and send_animation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_image_local_path_uploads(media_file):
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    result = await adapter.send_image(
+        chat_id="room-1",
+        image_url=media_file,
+        caption="from disk",
+    )
+
+    assert result.success
+    assert client.uploads[0]["file_path"] == media_file
+    assert client.uploads[0]["text"] == "from disk"
+
+
+@pytest.mark.asyncio
+async def test_send_image_file_uri_uploads(media_file):
+    from urllib.parse import quote
+
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+    file_uri = f"file://{quote(media_file)}"
+
+    result = await adapter.send_image(chat_id="room-1", image_url=file_uri)
+
+    assert result.success
+    assert client.uploads[0]["file_path"] == media_file
+
+
+@pytest.mark.asyncio
+async def test_send_image_http_downloads_then_uploads(media_file, monkeypatch):
+    """http(s) image sources must be downloaded (guarded) then uploaded."""
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    async def fake_download(url, ext):
+        return media_file
+
+    monkeypatch.setattr(adapter, "_download_media_url", fake_download)
+
+    result = await adapter.send_image(
+        chat_id="room-1",
+        image_url="https://example.com/pic.png",
+    )
+
+    assert result.success
+    assert client.uploads[0]["file_path"] == media_file
+
+
+@pytest.mark.asyncio
+async def test_send_image_download_failure_returns_error(monkeypatch):
+    """Unsafe/unreachable URL must yield a failure SendResult, not a fallback send."""
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    async def failing_download(url, ext):
+        raise RocketChatClientError("Blocked unsafe URL (SSRF protection)")
+
+    monkeypatch.setattr(adapter, "_download_media_url", failing_download)
+
+    result = await adapter.send_image(
+        chat_id="room-1",
+        image_url="https://example.com/evil.png",
+    )
+
+    assert not result.success
+    assert "Blocked unsafe URL" in result.error
+    assert client.uploads == []
+
+
+@pytest.mark.asyncio
+async def test_send_animation_gif_uploads(media_file):
+    """send_animation must upload the GIF natively (file or downloaded)."""
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    result = await adapter.send_animation(
+        chat_id="room-1",
+        animation_url=media_file,
+    )
+
+    assert result.success
+    assert client.uploads[0]["file_path"] == media_file
+
+
+# ---------------------------------------------------------------------------
+# send_multiple_images
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_multiple_images_uploads_batch(media_file, doc_file, monkeypatch):
+    """Each file:// image in the batch must be uploaded via send_image."""
+    from urllib.parse import quote
+
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    images = [
+        (f"file://{quote(media_file)}", "first"),
+        (f"file://{quote(doc_file)}", "second"),
+    ]
+
+    await adapter.send_multiple_images(chat_id="room-1", images=images)
+
+    assert len(client.uploads) == 2
+    assert client.uploads[0]["file_path"] == media_file
+    assert client.uploads[0]["text"] == "first"
+    assert client.uploads[1]["file_path"] == doc_file
+    assert client.uploads[1]["text"] == "second"
+
+
+@pytest.mark.asyncio
+async def test_send_multiple_images_skips_bad_sources(media_file, monkeypatch):
+    """Unsupported sources must not crash the batch loop."""
+    from urllib.parse import quote
+
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    images = [
+        (f"file://{quote(media_file)}", "good"),
+        ("ftp://weird/source", "bad"),
+    ]
+
+    results = await adapter.send_multiple_images(chat_id="room-1", images=images)
+
+    assert len(client.uploads) == 1
+    assert results[1].success is False
