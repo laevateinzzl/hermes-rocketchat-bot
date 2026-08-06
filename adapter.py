@@ -10,9 +10,13 @@ import asyncio
 import inspect
 import json
 import os
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, TypeVar
+
+_KT = TypeVar("_KT")
+_VT = TypeVar("_VT")
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +103,9 @@ def parse_config(extra: dict[str, Any] | None = None) -> RocketChatConfig:
         extra = {}
 
     def _get(key: str, default: Any = "") -> str:
-        return str(extra.get(key) or os.environ.get(f"ROCKETCHAT_{key.upper()}", default))
+        return str(
+            extra.get(key) or os.environ.get(f"ROCKETCHAT_{key.upper()}", default)
+        )
 
     cfg = RocketChatConfig(
         server_url=_get("server_url"),
@@ -109,23 +115,74 @@ def parse_config(extra: dict[str, Any] | None = None) -> RocketChatConfig:
         username=_get("username"),
         password=_get("password"),
         transport=_get("transport", "polling"),
-        poll_interval_seconds=_parse_float_safe(extra.get("poll_interval_seconds") or os.environ.get("ROCKETCHAT_POLL_INTERVAL_SECONDS", "3"), 3.0),
-        mention_names=_parse_csv(extra.get("mention_names") or os.environ.get("ROCKETCHAT_MENTION_NAMES", "")),
-        force_thread=_parse_bool(extra.get("force_thread") or os.environ.get("ROCKETCHAT_FORCE_THREAD")),
+        poll_interval_seconds=_parse_float_safe(
+            extra.get("poll_interval_seconds")
+            or os.environ.get("ROCKETCHAT_POLL_INTERVAL_SECONDS", "3"),
+            3.0,
+        ),
+        mention_names=_parse_csv(
+            extra.get("mention_names") or os.environ.get("ROCKETCHAT_MENTION_NAMES", "")
+        ),
+        force_thread=_parse_bool(
+            extra.get("force_thread") or os.environ.get("ROCKETCHAT_FORCE_THREAD")
+        ),
         home_channel=_get("home_channel"),
-        media_cache_dir=extra.get("media_cache_dir") or os.environ.get("ROCKETCHAT_MEDIA_CACHE_DIR", ""),
-        allowed_users=_parse_csv(extra.get("allowed_users") or os.environ.get("ROCKETCHAT_ALLOWED_USERS", "")),
-        allow_all=_parse_bool(extra.get("allow_all") or os.environ.get("ROCKETCHAT_ALLOW_ALL_USERS")),
-        max_message_length=_parse_int_safe(extra.get("max_message_length") or os.environ.get("ROCKETCHAT_MAX_MESSAGE_LENGTH", "4000"), 4000),
-        receive_timeout=_parse_float_safe(extra.get("receive_timeout") or os.environ.get("ROCKETCHAT_RECEIVE_TIMEOUT", "60"), 60.0),
-        ping_timeout=_parse_float_safe(extra.get("ping_timeout") or os.environ.get("ROCKETCHAT_PING_TIMEOUT", "10"), 10.0),
-        reconnect_initial_delay=_parse_float_safe(extra.get("reconnect_initial_delay") or os.environ.get("ROCKETCHAT_RECONNECT_INITIAL_DELAY", "1"), 1.0),
-        reconnect_max_delay=_parse_float_safe(extra.get("reconnect_max_delay") or os.environ.get("ROCKETCHAT_RECONNECT_MAX_DELAY", "60"), 60.0),
-        reconnect_max_attempts=_parse_int_safe(extra.get("reconnect_max_attempts") or os.environ.get("ROCKETCHAT_RECONNECT_MAX_ATTEMPTS", "0"), 0),
-        reconnect_jitter=_parse_float_safe(extra.get("reconnect_jitter") or os.environ.get("ROCKETCHAT_RECONNECT_JITTER", "0.25"), 0.25),
-        dedup_enabled=_parse_bool(extra.get("dedup_enabled") or os.environ.get("ROCKETCHAT_DEDUP_ENABLED", "true")),
-        dedup_ttl_hours=_parse_float_safe(extra.get("dedup_ttl_hours") or os.environ.get("ROCKETCHAT_DEDUP_TTL_HOURS", "168"), 168.0),
-        dedup_store_path=str(extra.get("dedup_store_path") or os.environ.get("ROCKETCHAT_DEDUP_STORE_PATH", "")),
+        media_cache_dir=extra.get("media_cache_dir")
+        or os.environ.get("ROCKETCHAT_MEDIA_CACHE_DIR", ""),
+        allowed_users=_parse_csv(
+            extra.get("allowed_users") or os.environ.get("ROCKETCHAT_ALLOWED_USERS", "")
+        ),
+        allow_all=_parse_bool(
+            extra.get("allow_all") or os.environ.get("ROCKETCHAT_ALLOW_ALL_USERS")
+        ),
+        max_message_length=_parse_int_safe(
+            extra.get("max_message_length")
+            or os.environ.get("ROCKETCHAT_MAX_MESSAGE_LENGTH", "4000"),
+            4000,
+        ),
+        receive_timeout=_parse_float_safe(
+            extra.get("receive_timeout")
+            or os.environ.get("ROCKETCHAT_RECEIVE_TIMEOUT", "60"),
+            60.0,
+        ),
+        ping_timeout=_parse_float_safe(
+            extra.get("ping_timeout")
+            or os.environ.get("ROCKETCHAT_PING_TIMEOUT", "10"),
+            10.0,
+        ),
+        reconnect_initial_delay=_parse_float_safe(
+            extra.get("reconnect_initial_delay")
+            or os.environ.get("ROCKETCHAT_RECONNECT_INITIAL_DELAY", "1"),
+            1.0,
+        ),
+        reconnect_max_delay=_parse_float_safe(
+            extra.get("reconnect_max_delay")
+            or os.environ.get("ROCKETCHAT_RECONNECT_MAX_DELAY", "60"),
+            60.0,
+        ),
+        reconnect_max_attempts=_parse_int_safe(
+            extra.get("reconnect_max_attempts")
+            or os.environ.get("ROCKETCHAT_RECONNECT_MAX_ATTEMPTS", "0"),
+            0,
+        ),
+        reconnect_jitter=_parse_float_safe(
+            extra.get("reconnect_jitter")
+            or os.environ.get("ROCKETCHAT_RECONNECT_JITTER", "0.25"),
+            0.25,
+        ),
+        dedup_enabled=_parse_bool(
+            extra.get("dedup_enabled")
+            or os.environ.get("ROCKETCHAT_DEDUP_ENABLED", "true")
+        ),
+        dedup_ttl_hours=_parse_float_safe(
+            extra.get("dedup_ttl_hours")
+            or os.environ.get("ROCKETCHAT_DEDUP_TTL_HOURS", "168"),
+            168.0,
+        ),
+        dedup_store_path=str(
+            extra.get("dedup_store_path")
+            or os.environ.get("ROCKETCHAT_DEDUP_STORE_PATH", "")
+        ),
     )
 
     return cfg
@@ -390,9 +447,11 @@ class RocketChatClient:
         """Return an aiohttp ClientSession (lazy import to keep deps optional)."""
         try:
             import aiohttp  # type: ignore[reportMissingImports]
+
             return aiohttp.ClientSession()
         except ImportError:
-            import httpx
+            import httpx  # type: ignore[import-not-found]
+
             return httpx.AsyncClient()
 
     async def _request(
@@ -426,7 +485,9 @@ class RocketChatClient:
                 read_fn = resp.aread if hasattr(resp, "aread") else resp.read
                 body = await _maybe_await(read_fn())
                 if status is not None and status >= 400:
-                    raise RocketChatClientError(f"{method} {path} failed: HTTP {status}")
+                    raise RocketChatClientError(
+                        f"{method} {path} failed: HTTP {status}"
+                    )
                 return body
 
             if status is not None and status >= 400:
@@ -561,7 +622,9 @@ class RocketChatClient:
         if last_update:
             payload["lastUpdate"] = last_update
         try:
-            return await self._request("POST", "/api/v1/chat.syncMessages", json=payload)
+            return await self._request(
+                "POST", "/api/v1/chat.syncMessages", json=payload
+            )
         except RocketChatNotFoundError:
             if not room_type:
                 raise
@@ -584,7 +647,9 @@ class RocketChatClient:
             "d": "/api/v1/im.history",
         }.get(room_type)
         if endpoint is None:
-            raise RocketChatClientError(f"Unsupported Rocket.Chat room type: {room_type}")
+            raise RocketChatClientError(
+                f"Unsupported Rocket.Chat room type: {room_type}"
+            )
 
         params: dict[str, Any] = {"roomId": room_id, "count": 100}
         if oldest:
@@ -773,6 +838,7 @@ def classify_attachment(candidate: AttachmentCandidate) -> str:
 
     # Fallback: classify by file extension
     from pathlib import Path
+
     ext = Path(candidate.title).suffix.lower() if candidate.title else ""
 
     image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".tiff"}
@@ -822,6 +888,7 @@ async def resolve_message_media(
         if cache_dir and candidate.url:
             safe_name = sanitize_filename(candidate.title or "attachment")
             from pathlib import Path
+
             dest = Path(cache_dir) / safe_name
             dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -831,6 +898,7 @@ async def resolve_message_media(
                 local_path = str(dest)
             except Exception:
                 import logging
+
                 logging.getLogger(__name__).warning(
                     "Failed to download attachment: %s", candidate.url
                 )
@@ -866,6 +934,30 @@ class InMemoryCheckpointStore:
         self._checkpoints[room_id] = updated_at
 
 
+class BoundedDict(OrderedDict[_KT, _VT]):
+    """OrderedDict with oldest-first eviction past a maximum size.
+
+    Mirrors the cache-bounding pattern Hermes applied to its Slack adapters
+    (533e54123 / d42b29579 / 91693f9d4): per-chat tracking structures must
+    not grow without bound on a long-running gateway.  Re-setting an existing
+    key refreshes its position (LRU-ish) before eviction applies.
+    """
+
+    def __init__(self, maxsize: int = 500):
+        super().__init__()
+        try:
+            self.maxsize = max(int(maxsize), 1)
+        except (TypeError, ValueError):
+            self.maxsize = 500
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        while len(self) > self.maxsize:
+            self.popitem(last=False)
+
+
 class PersistentSeenIdStore:
     """Disk-backed seen-message-id store for WebSocket reconnect dedup.
 
@@ -891,6 +983,7 @@ class PersistentSeenIdStore:
         if not self._path:
             return
         import json
+
         try:
             with open(self._path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -899,6 +992,7 @@ class PersistentSeenIdStore:
         if not isinstance(data, dict):
             return
         import time
+
         now = time.time()
         self._seen = {}
         for k, v in data.items():
@@ -911,6 +1005,7 @@ class PersistentSeenIdStore:
         if not msg_id:
             return False
         import time
+
         ts = self._seen.get(msg_id)
         if ts is None:
             return False
@@ -926,6 +1021,7 @@ class PersistentSeenIdStore:
         if not msg_id:
             return
         import time
+
         self._seen[msg_id] = time.time()
         self._dirty = True
 
@@ -936,6 +1032,7 @@ class PersistentSeenIdStore:
         import json
         import os
         import tempfile
+
         directory = os.path.dirname(self._path)
         if directory:
             try:
@@ -944,10 +1041,9 @@ class PersistentSeenIdStore:
                 pass
         # Prune expired entries before writing
         import time
+
         now = time.time()
-        self._seen = {
-            k: v for k, v in self._seen.items() if now - v < self._ttl
-        }
+        self._seen = {k: v for k, v in self._seen.items() if now - v < self._ttl}
         try:
             fd, tmp = tempfile.mkstemp(dir=directory or ".", suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -982,6 +1078,7 @@ class PollingTransport:
         """Begin polling in the background."""
         self._running = True
         import asyncio
+
         self._task = asyncio.create_task(self._poll_loop())
 
     async def stop(self):
@@ -999,11 +1096,14 @@ class PollingTransport:
         retry_after = getattr(error, "retry_after", None)
         if retry_after is None:
             return self.poll_interval
-        return max(self.poll_interval, _parse_float_safe(retry_after, self.poll_interval))
+        return max(
+            self.poll_interval, _parse_float_safe(retry_after, self.poll_interval)
+        )
 
     async def _poll_loop(self):
         """Repeatedly poll while running."""
         import asyncio
+
         while self._running:
             try:
                 events = await self.poll_once()
@@ -1012,6 +1112,7 @@ class PollingTransport:
                         await self._on_message(event)
             except RocketChatRateLimitError as exc:
                 import logging
+
                 delay = self._sleep_after_error(exc)
                 logging.getLogger(__name__).warning(
                     "Rocket.Chat polling rate limited; backing off for %.1f seconds",
@@ -1021,6 +1122,7 @@ class PollingTransport:
                 continue
             except Exception:
                 import logging
+
                 logging.getLogger(__name__).exception("Polling error")
             await asyncio.sleep(self.poll_interval)
 
@@ -1031,7 +1133,7 @@ class PollingTransport:
         # 1. Get subscriptions updated since last check
         updates: list[tuple[str, dict]] = []
         subscriptions = await self._client.list_subscriptions()
-        for sub in (subscriptions or []):
+        for sub in subscriptions or []:
             room_id = sub.get("rid") or sub.get("_id", "")
             if not room_id:
                 continue
@@ -1093,15 +1195,15 @@ class PollingTransport:
 
 # Resolve the Hermes gateway so we can import from ``gateway.platforms.base``
 # the same way built-in platform plugins do (e.g. Telegram).
-import sys as _sys
-from pathlib import Path as _Path
+import sys as _sys  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
 
 _HERMES_AGENT = _Path.home() / ".hermes" / "hermes-agent"
 if str(_HERMES_AGENT) not in _sys.path:
     _sys.path.insert(0, str(_HERMES_AGENT))
 
 try:
-    from gateway.config import Platform  # type: ignore[import-not-found]
+    from gateway.config import Platform  # type: ignore[import-not-found]  # noqa: F401
     from gateway.platforms.base import (  # type: ignore[import-not-found]
         BasePlatformAdapter,
         MessageEvent,
@@ -1115,7 +1217,6 @@ except ImportError:
     async def cache_image_from_url(url: str, ext: str = ".jpg") -> str:
         """Hermes image-cache downloader stub (unavailable without Hermes)."""
         raise RocketChatClientError("Image download unavailable (Hermes not installed)")
-
 
     class MessageType(str, Enum):
         TEXT = "text"
@@ -1157,10 +1258,35 @@ except ImportError:
             self._connected = False
             self._message_handler: Any = None
             self._status_text: dict[str, str] = {}
+            self._fatal_error_code: str | None = None
+            self._fatal_error_message: str | None = None
+            self._fatal_error_retryable = True
 
         @property
         def is_connected(self) -> bool:
             return self._connected
+
+        def has_fatal_error(self) -> bool:
+            return self._fatal_error_message is not None
+
+        @property
+        def fatal_error_message(self) -> str | None:
+            return self._fatal_error_message
+
+        @property
+        def fatal_error_code(self) -> str | None:
+            return self._fatal_error_code
+
+        @property
+        def fatal_error_retryable(self) -> bool:
+            return self._fatal_error_retryable
+
+        def _set_fatal_error(
+            self, code: str, message: str, *, retryable: bool = True
+        ) -> None:
+            self._fatal_error_code = code
+            self._fatal_error_message = message
+            self._fatal_error_retryable = retryable
 
         def set_message_handler(self, handler: Any) -> None:
             self._message_handler = handler
@@ -1265,12 +1391,14 @@ class WebSocketTransport:
         reconnect_max_delay: float = 60.0,
         reconnect_max_attempts: int = 0,
         reconnect_jitter: float = 0.25,
+        on_auth_failure: Any = None,
     ):
         self._client = client
         self.ws_url = ws_url or _ws_url(client.server_url)
         self._ws_factory = ws_factory or self._default_ws_factory
         self._on_message: Any = None
         self._on_status: Any = None
+        self._on_auth_failure: Any = on_auth_failure
         self._running = False
         self._task: asyncio.Task[Any] | None = None
         self._seen_ids: set[str] = set()
@@ -1281,7 +1409,9 @@ class WebSocketTransport:
         self._receive_timeout = max(0.01, _parse_float_safe(receive_timeout, 60.0))
         self._ping_timeout = max(0.01, _parse_float_safe(ping_timeout, 10.0))
         self._initial_delay = max(0.01, _parse_float_safe(reconnect_initial_delay, 1.0))
-        self._max_delay = max(self._initial_delay, _parse_float_safe(reconnect_max_delay, 60.0))
+        self._max_delay = max(
+            self._initial_delay, _parse_float_safe(reconnect_max_delay, 60.0)
+        )
         self._max_attempts = max(0, _parse_int_safe(reconnect_max_attempts, 0))
         self._jitter = max(0.0, min(0.5, _parse_float_safe(reconnect_jitter, 0.25)))
         # Reconnect bookkeeping (reset on a successful handshake)
@@ -1333,6 +1463,7 @@ class WebSocketTransport:
             self._on_status(status, detail or {})
         except Exception:
             import logging
+
             logging.getLogger(__name__).exception("Error in on_status callback")
 
     # -- backoff helper -------------------------------------------------------
@@ -1341,7 +1472,7 @@ class WebSocketTransport:
         """Compute the next reconnect delay using exponential backoff + jitter."""
         import random
 
-        base = self._initial_delay * (2 ** self._reconnect_attempts)
+        base = self._initial_delay * (2**self._reconnect_attempts)
         base = min(base, self._max_delay)
         jitter = base * self._jitter
         return base + random.uniform(-jitter, jitter)
@@ -1457,8 +1588,7 @@ class WebSocketTransport:
             return
         self._reconnect_attempts += 1
         reached_cap = (
-            self._max_attempts > 0
-            and self._reconnect_attempts > self._max_attempts
+            self._max_attempts > 0 and self._reconnect_attempts > self._max_attempts
         )
         if reached_cap:
             log.error(
@@ -1499,11 +1629,20 @@ class WebSocketTransport:
         """Re-run client initialization to obtain a fresh auth token."""
         try:
             await self._client.initialize()
-        except Exception:
+        except Exception as exc:
             import logging
+
             logging.getLogger(__name__).warning(
                 "Re-authentication failed; will retry on next reconnect"
             )
+            # Surface the failure to the adapter so a permanently invalid
+            # credential can be reported as a fatal (non-retryable) error.
+            callback = self._on_auth_failure
+            if callable(callback):
+                try:
+                    callback(str(exc))
+                except Exception:
+                    pass
 
     # -- DDP handshake --------------------------------------------------------
 
@@ -1685,17 +1824,17 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         self._message_handler: Any = None
         self._client: RocketChatClient | None = None
         self._transport: Any = None
-        self._room_info: dict[str, dict[str, Any]] = {}
-        self._typing_placeholders: dict[str, str] = {}
+        self._room_info: BoundedDict[str, dict[str, Any]] = BoundedDict(maxsize=200)
+        self._typing_placeholders: BoundedDict[str, str] = BoundedDict(maxsize=500)
         # Live stream-preview markers: placeholder key → message id of a
         # message that is currently being edited by the Hermes stream
         # consumer.  While a preview is live, send_typing() must NOT create a
         # second "Thinking…" bubble — the growing preview is the indicator.
-        self._stream_previews: dict[str, str] = {}
+        self._stream_previews: BoundedDict[str, str] = BoundedDict(maxsize=200)
         # Last status phrase rendered into each placeholder (key → text), so
         # repeated typing refreshes only edit the placeholder when the live
         # status actually changed.
-        self._last_status_text: dict[str, str] = {}
+        self._last_status_text: BoundedDict[str, str] = BoundedDict(maxsize=500)
         self._cfg: RocketChatConfig | None = None
         self._seen_id_store: PersistentSeenIdStore | None = None
 
@@ -1739,7 +1878,9 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             if hermes_home:
                 path = os.path.join(hermes_home, "rocketchat_seen_ids.json")
             else:
-                path = os.path.join(os.path.expanduser("~"), ".hermes", "rocketchat_seen_ids.json")
+                path = os.path.join(
+                    os.path.expanduser("~"), ".hermes", "rocketchat_seen_ids.json"
+                )
         self._seen_id_store = PersistentSeenIdStore(
             path=path,
             ttl_seconds=max(1.0, cfg.dedup_ttl_hours) * 3600,
@@ -1752,6 +1893,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
     def _on_transport_status(self, status: str, detail: dict[str, Any]) -> None:
         """Log WebSocket transport status changes for observability."""
         import logging
+
         log = logging.getLogger(__name__)
         if status == "connected":
             log.info("Rocket.Chat WebSocket connected")
@@ -1806,6 +1948,12 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             await self._client.initialize()
         except RocketChatClientError as exc:
             log.error("Rocket.Chat authentication failed: %s", exc)
+            # A definitive credential problem (401/403, invalid token/response)
+            # can never succeed by retrying — report it as non-retryable so the
+            # gateway exits instead of reconnecting forever.  Transient network
+            # failures stay retryable and return False without fatal metadata.
+            if _is_auth_failure_message(str(exc)):
+                self._mark_auth_fatal(str(exc))
             return False
 
         # Choose transport
@@ -1820,6 +1968,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 reconnect_max_delay=self._cfg.reconnect_max_delay,
                 reconnect_max_attempts=self._cfg.reconnect_max_attempts,
                 reconnect_jitter=self._cfg.reconnect_jitter,
+                on_auth_failure=self._mark_auth_fatal,
             )
             # Surface connection status in the adapter log for observability
             self._transport.set_on_status(self._on_transport_status)
@@ -2168,7 +2317,6 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         _flush()
         return chunks or [text]
 
-
     # -- native outbound media delivery (Hermes MEDIA: contract) ---------------
 
     async def _send_media_file(
@@ -2251,9 +2399,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         except RocketChatClientError:
             raise
         except Exception as exc:
-            raise RocketChatClientError(
-                f"Failed to download media: {exc}"
-            ) from exc
+            raise RocketChatClientError(f"Failed to download media: {exc}") from exc
 
     async def send_image_file(
         self,
@@ -2415,6 +2561,28 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 )
         return results
 
+    # -- fatal error reporting -------------------------------------------------
+
+    def _mark_auth_fatal(self, message: str) -> None:
+        """Report a non-retryable authentication failure to the gateway.
+
+        Uses the Hermes ``_set_fatal_error`` seam when the installed base
+        supports it; degrades to a no-op on older Hermes versions (the
+        adapter still fails closed by returning False from connect()).
+        """
+        if getattr(self, "has_fatal_error", None) and self.has_fatal_error():
+            return
+        setter = getattr(self, "_set_fatal_error", None)
+        if callable(setter):
+            try:
+                setter(
+                    "AUTH_FAILED",
+                    f"Rocket.Chat authentication failed: {message}",
+                    retryable=False,
+                )
+            except Exception:
+                pass
+
     # -- inbound callback -----------------------------------------------------
 
     async def _on_inbound(
@@ -2464,6 +2632,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         if self._seen_id_store is not None:
             if self._seen_id_store.contains(msg_id):
                 import logging
+
                 logging.getLogger(__name__).debug(
                     "Rocket.Chat inbound dedup: skipping already-seen msg_id=%s", msg_id
                 )
@@ -2496,9 +2665,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 event, self._client, self._cfg.media_cache_dir
             )
         else:
-            media_urls, media_types = await resolve_message_media(
-                event, self._client
-            )
+            media_urls, media_types = await resolve_message_media(event, self._client)
 
         # Determine reply target
         reply_to = event.get("tmid", "")
@@ -2656,6 +2823,27 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         return {}
 
 
+def _is_auth_failure_message(message: str) -> bool:
+    """Return True when an error string indicates a definitive auth failure.
+
+    Matches HTTP 401/403 responses and Rocket.Chat's invalid-token/credential
+    phrasing.  Transient failures (timeouts, connection refused) never match,
+    so the gateway keeps them retryable.
+    """
+    lowered = str(message).lower()
+    markers = (
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "invalid token",
+        "invalid response",
+        "invalid-user",
+        "invalid user",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def _rc_room_type_to_chat_type(room_type: str) -> str:
     """Map Rocket.Chat room type codes to Hermes chat types.
 
@@ -2768,11 +2956,13 @@ def check_requirements() -> bool:
     """
     try:
         import aiohttp  # type: ignore[reportMissingImports]  # noqa: F401
+
         return True
     except ImportError:
         pass
     try:
         import httpx  # type: ignore[import-not-found]  # noqa: F401
+
         return True
     except ImportError:
         pass
