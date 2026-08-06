@@ -5,7 +5,6 @@ import pytest
 from adapter import (
     RocketChatClient,
     RocketChatClientError,
-    RocketChatIdentity,
     RocketChatRateLimitError,
 )
 
@@ -240,7 +239,7 @@ async def test_post_message_without_tmid():
     client = FakeClient(session)
     await client.initialize()
 
-    result = await client.post_message(room_id="room-abc", text="hi")
+    await client.post_message(room_id="room-abc", text="hi")
 
     req = session.requests[1]
     assert "tmid" not in req["json"]

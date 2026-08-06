@@ -103,7 +103,6 @@ async def test_adapter_connect_initializes_client_and_starts_transport():
     client = FakeClient()
 
     # Monkey-patch connect to use our fakes
-    original_connect = adapter.connect
 
     async def fake_connect():
         setattr(adapter, "_client", client)

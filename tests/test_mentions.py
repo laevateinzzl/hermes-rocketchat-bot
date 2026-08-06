@@ -172,9 +172,7 @@ def test_parse_config_reads_mention_overrides():
 
 class _FakeClient:
     def __init__(self):
-        self._identity = type(
-            "I", (), {"user_id": "bot1", "username": "hermesbot"}
-        )()
+        self._identity = type("I", (), {"user_id": "bot1", "username": "hermesbot"})()
 
     @property
     def identity(self):

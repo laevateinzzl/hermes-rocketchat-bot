@@ -2761,9 +2761,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             )
             if not always_respond:
                 mention_names = self._cfg.mention_names if self._cfg else []
-                ignore_other = bool(
-                    self._cfg and self._cfg.ignore_other_user_mentions
-                )
+                ignore_other = bool(self._cfg and self._cfg.ignore_other_user_mentions)
                 text = event.get("msg", "")
                 mentions = event.get("mentions", [])
 

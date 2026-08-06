@@ -1,6 +1,6 @@
 """Tests for configuration parsing (RocketChatConfig, parse_config, env_enablement)."""
 
-from adapter import RocketChatConfig, env_enablement, parse_config
+from adapter import env_enablement, parse_config
 
 
 def test_token_config_from_env(monkeypatch):
@@ -97,7 +97,7 @@ def test_env_enablement_with_allow_all(monkeypatch):
     seed = env_enablement()
 
     assert seed is not None
-    assert seed["allow_all"] == True
+    assert seed["allow_all"]
     assert seed["allowed_users"] == []
 
 
@@ -146,4 +146,4 @@ def test_parse_config_allow_all(monkeypatch):
 
     cfg = parse_config({})
 
-    assert cfg.allow_all == True
+    assert cfg.allow_all

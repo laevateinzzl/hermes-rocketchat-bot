@@ -68,8 +68,16 @@ class FakeUploadSession:
 class FakeUploadClient(RocketChatClient):
     """RocketChatClient wired to a FakeUploadSession."""
 
-    def __init__(self, session, server_url="https://chat.example.com", user_id="bot1", access_token="tok"):
-        super().__init__(server_url=server_url, user_id=user_id, access_token=access_token)
+    def __init__(
+        self,
+        session,
+        server_url="https://chat.example.com",
+        user_id="bot1",
+        access_token="tok",
+    ):
+        super().__init__(
+            server_url=server_url, user_id=user_id, access_token=access_token
+        )
         self._session = session
 
     async def _get_session(self):
@@ -95,7 +103,14 @@ async def test_upload_attachment_calls_rooms_media_and_confirm():
                 # rooms.media response
                 FakeUploadResponse(
                     status=200,
-                    json_data={"success": True, "file": {"_id": "file-1", "name": "test.png", "type": "image/png"}},
+                    json_data={
+                        "success": True,
+                        "file": {
+                            "_id": "file-1",
+                            "name": "test.png",
+                            "type": "image/png",
+                        },
+                    },
                 ),
                 # rooms.mediaConfirm response
                 FakeUploadResponse(
@@ -185,7 +200,9 @@ async def test_room_id_target_passes_through():
     """A real room id is used as-is (one rooms.info probe)."""
     session = FakeUploadSession(
         responses=[
-            FakeUploadResponse(status=200, json_data={"success": True, "room": {"_id": "room-1"}}),
+            FakeUploadResponse(
+                status=200, json_data={"success": True, "room": {"_id": "room-1"}}
+            ),
         ]
     )
     client = FakeUploadClient(session)
@@ -203,11 +220,21 @@ async def test_user_id_target_resolved_to_dm():
     session = FakeUploadSession(
         responses=[
             # rooms.info -> 404 (not a room)
-            FakeUploadResponse(status=404, json_data={"success": False, "error": "room-not-found"}),
+            FakeUploadResponse(
+                status=404, json_data={"success": False, "error": "room-not-found"}
+            ),
             # users.info(userId) -> username
-            FakeUploadResponse(status=200, json_data={"success": True, "user": {"_id": "u-9", "username": "alice"}}),
+            FakeUploadResponse(
+                status=200,
+                json_data={
+                    "success": True,
+                    "user": {"_id": "u-9", "username": "alice"},
+                },
+            ),
             # dm.create -> room
-            FakeUploadResponse(status=200, json_data={"success": True, "room": {"_id": "dm-9"}}),
+            FakeUploadResponse(
+                status=200, json_data={"success": True, "room": {"_id": "dm-9"}}
+            ),
         ]
     )
     client = FakeUploadClient(session)
@@ -226,12 +253,24 @@ async def test_username_target_resolved_to_dm():
     """A bare username target resolves via users.info(username) -> dm.create."""
     session = FakeUploadSession(
         responses=[
-            FakeUploadResponse(status=404, json_data={"success": False, "error": "room-not-found"}),
+            FakeUploadResponse(
+                status=404, json_data={"success": False, "error": "room-not-found"}
+            ),
             # users.info(userId=alice) -> 404 (it's a username, not an id)
-            FakeUploadResponse(status=404, json_data={"success": False, "error": "user-not-found"}),
+            FakeUploadResponse(
+                status=404, json_data={"success": False, "error": "user-not-found"}
+            ),
             # users.info(username=alice)
-            FakeUploadResponse(status=200, json_data={"success": True, "user": {"_id": "u-9", "username": "alice"}}),
-            FakeUploadResponse(status=200, json_data={"success": True, "room": {"_id": "dm-9"}}),
+            FakeUploadResponse(
+                status=200,
+                json_data={
+                    "success": True,
+                    "user": {"_id": "u-9", "username": "alice"},
+                },
+            ),
+            FakeUploadResponse(
+                status=200, json_data={"success": True, "room": {"_id": "dm-9"}}
+            ),
         ]
     )
     client = FakeUploadClient(session)
@@ -246,9 +285,15 @@ async def test_unresolvable_target_falls_back():
     """When nothing resolves, the original target is returned (post may fail)."""
     session = FakeUploadSession(
         responses=[
-            FakeUploadResponse(status=404, json_data={"success": False, "error": "room-not-found"}),
-            FakeUploadResponse(status=404, json_data={"success": False, "error": "user-not-found"}),
-            FakeUploadResponse(status=404, json_data={"success": False, "error": "user-not-found"}),
+            FakeUploadResponse(
+                status=404, json_data={"success": False, "error": "room-not-found"}
+            ),
+            FakeUploadResponse(
+                status=404, json_data={"success": False, "error": "user-not-found"}
+            ),
+            FakeUploadResponse(
+                status=404, json_data={"success": False, "error": "user-not-found"}
+            ),
         ]
     )
     client = FakeUploadClient(session)
@@ -264,17 +309,34 @@ async def test_standalone_send_resolves_user_target():
     session = FakeUploadSession(
         responses=[
             # client.initialize -> /api/v1/me
-            FakeUploadResponse(status=200, json_data={"success": True, "_id": "bot1", "username": "hermesbot"}),
+            FakeUploadResponse(
+                status=200,
+                json_data={"success": True, "_id": "bot1", "username": "hermesbot"},
+            ),
             # rooms.info -> 404
-            FakeUploadResponse(status=404, json_data={"success": False, "error": "room-not-found"}),
+            FakeUploadResponse(
+                status=404, json_data={"success": False, "error": "room-not-found"}
+            ),
             # users.info(userId) -> 404 (username target)
-            FakeUploadResponse(status=404, json_data={"success": False, "error": "user-not-found"}),
+            FakeUploadResponse(
+                status=404, json_data={"success": False, "error": "user-not-found"}
+            ),
             # users.info(username) -> user
-            FakeUploadResponse(status=200, json_data={"success": True, "user": {"_id": "u-9", "username": "alice"}}),
+            FakeUploadResponse(
+                status=200,
+                json_data={
+                    "success": True,
+                    "user": {"_id": "u-9", "username": "alice"},
+                },
+            ),
             # dm.create -> room
-            FakeUploadResponse(status=200, json_data={"success": True, "room": {"_id": "dm-9"}}),
+            FakeUploadResponse(
+                status=200, json_data={"success": True, "room": {"_id": "dm-9"}}
+            ),
             # chat.postMessage to the DM room
-            FakeUploadResponse(status=200, json_data={"success": True, "message": {"_id": "m-1"}}),
+            FakeUploadResponse(
+                status=200, json_data={"success": True, "message": {"_id": "m-1"}}
+            ),
         ]
     )
     client = FakeUploadClient(session)
@@ -284,8 +346,12 @@ async def test_standalone_send_resolves_user_target():
     adapter_module._delivery_room_cache.clear()
 
     result = await standalone_send(
-        pconfig={"server_url": "https://chat.example.com", "auth_mode": "token",
-                 "user_id": "bot1", "access_token": "tok"},
+        pconfig={
+            "server_url": "https://chat.example.com",
+            "auth_mode": "token",
+            "user_id": "bot1",
+            "access_token": "tok",
+        },
         chat_id="alice",
         message="hello alice",
         _client_factory=lambda: client,

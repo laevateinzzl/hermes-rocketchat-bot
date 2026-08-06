@@ -49,9 +49,7 @@ PARENT = {
 
 
 def _adapter(client):
-    adapter = RocketChatAdapter(
-        RocketChatConfig(server_url="https://chat.example.com")
-    )
+    adapter = RocketChatAdapter(RocketChatConfig(server_url="https://chat.example.com"))
     setattr(adapter, "_client", client)
     adapter._connected = True
     return adapter
