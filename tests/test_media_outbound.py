@@ -32,7 +32,10 @@ class FakeUploadClient:
             "tmid": tmid,
         }
         self.uploads.append(call)
-        return {"_id": f"media-{self._upload_counter}", "file": {"_id": f"f{self._upload_counter}"}}
+        return {
+            "_id": f"media-{self._upload_counter}",
+            "file": {"_id": f"f{self._upload_counter}"},
+        }
 
     @property
     def server_url(self):

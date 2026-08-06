@@ -68,10 +68,10 @@ async def test_connect_auth_401_marks_fatal_nonretryable(monkeypatch):
 
     result = await adapter.connect()
 
-    assert result is False
+    assert not result
     assert adapter.has_fatal_error()
     assert adapter.fatal_error_code == "AUTH_FAILED"
-    assert adapter.fatal_error_retryable is False
+    assert not adapter.fatal_error_retryable
     assert "HTTP 401" in adapter.fatal_error_message
 
 
@@ -82,7 +82,7 @@ async def test_connect_network_error_not_fatal(monkeypatch):
 
     result = await adapter.connect()
 
-    assert result is False
+    assert not result
     assert not adapter.has_fatal_error()
 
 
@@ -96,7 +96,7 @@ async def test_mark_auth_fatal_noop_when_base_unsupported(monkeypatch):
 
     result = await adapter.connect()
 
-    assert result is False  # still fails closed, just no fatal metadata
+    assert not result  # still fails closed, just no fatal metadata
 
 
 @pytest.mark.asyncio

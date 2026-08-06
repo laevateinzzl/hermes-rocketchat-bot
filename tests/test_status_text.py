@@ -45,9 +45,7 @@ class FakeClient:
 
 
 def _make_adapter(client=None, connected=True) -> RocketChatAdapter:
-    adapter = RocketChatAdapter(
-        RocketChatConfig(server_url="https://chat.example.com")
-    )
+    adapter = RocketChatAdapter(RocketChatConfig(server_url="https://chat.example.com"))
     setattr(adapter, "_client", client or FakeClient())
     adapter._connected = connected
     return adapter
