@@ -374,7 +374,9 @@ async def test_adapter_inbound_text_attachment_sets_not_inlined_flag():
 
     assert len(handled) == 1
     event = handled[0]
-    assert event.media_urls == ["/file-upload/dm-room-1/f-txt-1/notes.txt"]
+    assert event.media_urls == [
+        "https://chat.example.com/file-upload/dm-room-1/f-txt-1/notes.txt"
+    ]
     assert event.media_text_inlined == [False]
 
 

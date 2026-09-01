@@ -109,35 +109,49 @@ def _ping_frame():
 
 
 def _login_result(user_id="bot-user-id"):
-    return json.dumps({
-        "msg": "result",
-        "id": "1",
-        "result": {"id": user_id, "token": "tok", "tokenExpires": {"$date": 9999999999999}},
-    })
+    return json.dumps(
+        {
+            "msg": "result",
+            "id": "1",
+            "result": {
+                "id": user_id,
+                "token": "tok",
+                "tokenExpires": {"$date": 9999999999999},
+            },
+        }
+    )
 
 
 def _sub_ready(sub_id="sub-room-1"):
     return json.dumps({"msg": "ready", "subs": [sub_id]})
 
 
-def _room_message(room_id="room-1", msg_id="msg-1", text="hello", sender_id="alice", sender_name="alice"):
-    return json.dumps({
-        "msg": "changed",
-        "collection": "stream-room-messages",
-        "id": room_id,
-        "fields": {
-            "eventName": room_id,
-            "args": [
-                {
-                    "_id": msg_id,
-                    "rid": room_id,
-                    "msg": text,
-                    "u": {"_id": sender_id, "username": sender_name},
-                    "ts": "2024-01-01T00:00:00.000Z",
-                }
-            ],
-        },
-    })
+def _room_message(
+    room_id="room-1",
+    msg_id="msg-1",
+    text="hello",
+    sender_id="alice",
+    sender_name="alice",
+):
+    return json.dumps(
+        {
+            "msg": "changed",
+            "collection": "stream-room-messages",
+            "id": room_id,
+            "fields": {
+                "eventName": room_id,
+                "args": [
+                    {
+                        "_id": msg_id,
+                        "rid": room_id,
+                        "msg": text,
+                        "u": {"_id": sender_id, "username": sender_name},
+                        "ts": "2024-01-01T00:00:00.000Z",
+                    }
+                ],
+            },
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +329,9 @@ async def test_websocket_subscribes_to_rooms_after_login():
     await _run_and_stop(transport)
 
     # Should have subscribed to room streams
-    sub_frames = [_decode_frame(f) for f in ws.sent_frames if _decode_frame(f).get("msg") == "sub"]
+    sub_frames = [
+        _decode_frame(f) for f in ws.sent_frames if _decode_frame(f).get("msg") == "sub"
+    ]
     assert len(sub_frames) >= 1
     # Each sub should target stream-room-messages
     for sf in sub_frames:
@@ -470,6 +486,7 @@ class HangingWebSocket(FakeWebSocket):
     async def receive(self):
         # aiohttp-style API path
         import asyncio as _a
+
         if self._recv_index < len(self._server_frames):
             frame = self._server_frames[self._recv_index]
             self._recv_index += 1
@@ -571,7 +588,13 @@ async def test_auth_error_triggers_reauthentication():
         server_frames=[
             _connected_frame(),
             # login result reports an auth error
-            json.dumps({"msg": "result", "id": "1", "error": {"message": "401 unauthorized token expired"}}),
+            json.dumps(
+                {
+                    "msg": "result",
+                    "id": "1",
+                    "error": {"message": "401 unauthorized token expired"},
+                }
+            ),
         ]
     )
     client = ReauthClient(subscriptions=[])
@@ -587,6 +610,7 @@ async def test_auth_error_triggers_reauthentication():
 
     # Manually invoke the error handler with an auth-shaped exception
     import logging
+
     await transport._handle_connection_error(
         RocketChatClientError("401 unauthorized: token expired"),
         logging.getLogger("test"),

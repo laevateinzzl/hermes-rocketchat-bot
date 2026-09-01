@@ -1,7 +1,7 @@
 name: rocketchat-platform
 label: Rocket.Chat
 kind: platform
-version: 0.2.1
+version: 0.3.0
 description: Rocket.Chat gateway adapter for Hermes Agent
 author: hermes-rocketchat-bot
 requires_env:

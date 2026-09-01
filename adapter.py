@@ -380,6 +380,70 @@ def _parse_retry_after(value: Any) -> float | None:
     return None
 
 
+def _absolutize_media_url(url: str, base: str) -> str:
+    """Join a relative Rocket.Chat upload URL onto the server origin.
+
+    Rocket.Chat file objects report ``/file-upload/<rid>/<fid>/<name>``
+    relative paths; they must be absolute before any HTTP client will
+    fetch them.  Absolute URLs pass through untouched.
+    """
+    if url.startswith(("http://", "https://")):
+        return url
+    if url.startswith("/") and base:
+        return f"{str(base).rstrip('/')}{url}"
+    return url
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    """Return True when both URLs share scheme, host and port."""
+    from urllib.parse import urlsplit
+
+    def _origin(url: str) -> tuple[str, str, int | None]:
+        parts = urlsplit(url)
+        port = parts.port
+        if port is None and parts.scheme == "https":
+            port = 443
+        elif port is None and parts.scheme == "http":
+            port = 80
+        return (parts.scheme, (parts.hostname or "").lower(), port)
+
+    left, right = _origin(url_a), _origin(url_b)
+    return left[0] in ("http", "https") and left == right
+
+
+async def _host_is_public(host: str) -> bool:
+    """Resolve *host* and verify none of its addresses is private.
+
+    SSRF guard for download targets chosen from untrusted message content:
+    blocks loopback, link-local, private (RFC1918), and otherwise
+    non-global addresses.  Resolution failure fails closed.
+    """
+    import ipaddress
+    import socket
+
+    try:
+        infos = await asyncio.getaddrinfo(host, None)
+    except (socket.gaierror, OSError):
+        return False
+    for info in infos[:8]:
+        try:
+            address = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if not address.is_global:
+            return False
+    return True
+
+
+async def _resolve_with_timeout(value: Any, timeout: float) -> Any:
+    """Await *value* (if awaitable) under a hard timeout."""
+    import inspect
+
+    if inspect.isawaitable(value):
+        return await asyncio.wait_for(value, timeout=timeout)
+    return value
+
+
 def _decode_ddp_frame(frame: str) -> dict[str, Any] | None:
     """Decode one DDP JSON frame, returning None for malformed frames."""
     from contextlib import suppress
@@ -448,6 +512,31 @@ async def _response_text(resp: Any) -> str:
     return str(data)
 
 
+def _multipart_request_kwargs(
+    session: Any, file_path: str, filename: str, content_type: str
+) -> dict[str, Any]:
+    """Build backend-specific multipart request kwargs for *file_path*.
+
+    aiohttp uploads via ``data=aiohttp.FormData()``, httpx via
+    ``files=``.  The payload is read into memory so neither backend keeps
+    a dangling file handle after this helper returns.
+    """
+    with open(file_path, "rb") as fh:
+        payload = fh.read()
+    try:
+        import aiohttp  # type: ignore[reportMissingImports]
+
+        if isinstance(session, aiohttp.ClientSession):
+            form = aiohttp.FormData()
+            form.add_field(
+                "file", payload, filename=filename, content_type=content_type
+            )
+            return {"data": form}
+    except ImportError:
+        pass
+    return {"files": {"file": (filename, payload, content_type)}}
+
+
 class RocketChatClient:
     """Async REST client for the Rocket.Chat API.
 
@@ -469,6 +558,9 @@ class RocketChatClient:
         self._username = username
         self._password = password
         self._identity: RocketChatIdentity | None = None
+        # Bounds for inbound attachment downloads (SSRF/DoS hardening).
+        self._download_timeout = 30.0
+        self._max_download_bytes = 64 * 1024 * 1024
 
     @property
     def identity(self) -> RocketChatIdentity | None:
@@ -499,8 +591,14 @@ class RocketChatClient:
         params: dict | None = None,
         headers: dict | None = None,
         raw: bool = False,
+        multipart: dict | None = None,
     ):
-        """Make an HTTP request to the Rocket.Chat REST API."""
+        """Make an HTTP request to the Rocket.Chat REST API.
+
+        ``multipart`` (optional dict with ``file_path``/``filename``/
+        ``content_type``) turns the request into a real file upload; it
+        takes precedence over ``json``.
+        """
         url = f"{self._server_url}{path}"
         default_headers = {
             "X-User-Id": self._user_id,
@@ -512,10 +610,17 @@ class RocketChatClient:
         session = await self._get_session()
 
         async with session:
-            resp = await _maybe_await(
-                session.request(
-                    method, url, json=json, params=params, headers=default_headers
+            if multipart is not None:
+                request_kwargs = _multipart_request_kwargs(
+                    session,
+                    multipart["file_path"],
+                    multipart.get("filename", ""),
+                    multipart.get("content_type", "application/octet-stream"),
                 )
+            else:
+                request_kwargs = {"json": json, "params": params}
+            resp = await _maybe_await(
+                session.request(method, url, headers=default_headers, **request_kwargs)
             )
             status = getattr(resp, "status", getattr(resp, "status_code", None))
             if raw:
@@ -763,18 +868,84 @@ class RocketChatClient:
     # -- download ------------------------------------------------------------
 
     async def download_attachment(self, url: str) -> bytes:
-        """Download a protected Rocket.Chat file attachment with auth headers."""
-        headers = {
-            "X-User-Id": self._user_id,
-            "X-Auth-Token": self._access_token,
-        }
+        """Download a file attachment with minimal privilege.
+
+        Security posture (SSRF + credential-leak hardening):
+
+        - Relative ``/file-upload/...`` URLs are joined onto the server origin
+          (Rocket.Chat file objects report relative paths).
+        - Only http(s) targets are fetched.
+        - The bot credentials (``X-User-Id``/``X-Auth-Token``) are attached
+          ONLY when the target host is the configured server; cross-origin
+          targets are fetched without credentials, must be https, and must
+          resolve to a public address (private/loopback/link-local blocked).
+        - Redirects are followed up to 2 hops, re-running the same checks on
+          every hop.
+        - A hard timeout (``download_timeout``) and size cap
+          (``max_download_bytes``) bound the fetch.
+        """
+        target = _absolutize_media_url(url, self._server_url)
         session = await self._get_session()
 
-        async with session:
-            resp = await _maybe_await(session.get(url, headers=headers))
-            resp.raise_for_status()
-            read_fn = resp.aread if hasattr(resp, "aread") else resp.read
-            return await _maybe_await(read_fn())
+        for _hop in range(3):  # initial request + up to 2 redirect hops
+            if not target.startswith(("http://", "https://")):
+                raise RocketChatClientError(
+                    f"Unsupported attachment URL: {str(url)[:120]}"
+                )
+
+            same_origin = _same_origin(target, self._server_url)
+            headers: dict[str, Any] = {}
+            if same_origin:
+                headers = {
+                    "X-User-Id": self._user_id,
+                    "X-Auth-Token": self._access_token,
+                }
+            else:
+                # Untrusted (attacker-chosen) target: no credentials, https
+                # only, no private/loopback addresses.
+                if not target.startswith("https://"):
+                    raise RocketChatClientError(
+                        "Cross-origin attachment downloads require https"
+                    )
+                if not await _host_is_public(target.split("/")[2].split(":")[0]):
+                    raise RocketChatClientError(
+                        "Blocked private/loopback attachment host"
+                    )
+
+            redirect_kwargs: dict[str, Any] = {}
+            try:
+                import aiohttp  # type: ignore[reportMissingImports]
+
+                uses_aiohttp = isinstance(session, aiohttp.ClientSession)
+            except ImportError:
+                uses_aiohttp = False
+            redirect_kwargs[
+                "allow_redirects" if uses_aiohttp else "follow_redirects"
+            ] = False
+
+            async with session:
+                resp = await _resolve_with_timeout(
+                    session.get(target, headers=headers, **redirect_kwargs),
+                    self._download_timeout,
+                )
+                if resp.status in (301, 302, 303, 307, 308) and resp.headers.get(
+                    "Location"
+                ):
+                    from urllib.parse import urljoin
+
+                    target = urljoin(target, resp.headers["Location"])
+                    continue
+                resp.raise_for_status()
+                read_fn = resp.aread if hasattr(resp, "aread") else resp.read
+                data = await _resolve_with_timeout(read_fn(), self._download_timeout)
+                if len(data) > self._max_download_bytes:
+                    raise RocketChatClientError(
+                        f"Attachment download exceeds size limit "
+                        f"({self._max_download_bytes} bytes)"
+                    )
+                return data
+
+        raise RocketChatClientError(f"Too many attachment redirects: {str(url)[:120]}")
 
     async def upload_attachment(
         self,
@@ -786,17 +957,12 @@ class RocketChatClient:
         """Upload a local file to a Rocket.Chat room.
 
         Uses the three-step Rocket.Chat file-upload flow:
-        1. ``POST /api/v1/rooms.media/{roomId}``  — upload the file
+        1. ``POST /api/v1/rooms.media/{roomId}``  — upload the file as real
+           multipart form data (the file bytes, not just metadata)
         2. ``POST /api/v1/rooms.mediaConfirm/{roomId}/{fileId}`` — confirm
         3. ``POST /api/v1/chat.postMessage`` — post the text message with file ref
-
-        .. note::
-
-           In a production deployment with real multipart uploads the first step
-           sends the file as form data.  The current implementation sends file
-           metadata as JSON so that tests with mock HTTP sessions can exercise the
-           full flow without multipart machinery.
         """
+        import mimetypes
         from pathlib import Path
 
         path = Path(file_path)
@@ -804,12 +970,17 @@ class RocketChatClient:
             raise RocketChatClientError(f"File not found: {file_path}")
 
         file_name = path.name
+        content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
 
-        # Step 1 — upload
+        # Step 1 — upload (multipart form data carrying the actual file)
         upload_result = await self._request(
             "POST",
             f"/api/v1/rooms.media/{room_id}",
-            json={"file_name": file_name, "file_path": str(path)},
+            multipart={
+                "file_path": str(path),
+                "filename": file_name,
+                "content_type": content_type,
+            },
         )
 
         if not upload_result.get("success", False):
@@ -1006,7 +1177,10 @@ async def resolve_message_media(
                 )
                 continue
         elif candidate.url:
-            local_path = candidate.url
+            # No cache dir: pass the URL through, absolutized against the
+            # server origin so downstream consumers can actually fetch it.
+            server_url = client.server_url if hasattr(client, "server_url") else ""
+            local_path = _absolutize_media_url(candidate.url, server_url)
         else:
             continue
 
@@ -2267,7 +2441,9 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             # the thinking placeholder when present.
             text = content
             max_len = self._cfg.max_message_length if self._cfg else 4000
-            if len(text) > max_len:
+            # 0 / negative means "no limit" (Hermes registry semantics) and
+            # must never reach the chunker (which would loop at max_len=0).
+            if max_len > 0 and len(text) > max_len:
                 chunks = self._split_long_text(text, max_len)
             else:
                 chunks = [text]
@@ -2353,7 +2529,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         try:
             text = content
             max_len = self._cfg.max_message_length if self._cfg else 4000
-            if len(text) > max_len:
+            if max_len > 0 and len(text) > max_len:
                 text = text[:max_len]
 
             result = await self._client.update_message(
@@ -2412,6 +2588,9 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         word boundary near the limit).  The concatenation ``"".join(chunks)``
         always equals the input exactly — nothing is truncated or inserted.
         """
+        if max_len <= 0:
+            return [text]
+        max_len = max(1, int(max_len))
         if len(text) <= max_len:
             return [text]
 

@@ -37,6 +37,21 @@ class FakeUploadClient:
             "file": {"_id": f"f{self._upload_counter}"},
         }
 
+    async def post_message(self, room_id, text, tmid=""):
+        if not hasattr(self, "post_message_calls"):
+            self.post_message_calls: list[dict] = []
+        call = {"room_id": room_id, "text": text, "tmid": tmid}
+        self.post_message_calls.append(call)
+        return {"_id": "m" + str(len(self.post_message_calls))}
+
+    async def update_message(self, room_id, message_id, text):
+        if not hasattr(self, "update_message_calls"):
+            self.update_message_calls: list[dict] = []
+        self.update_message_calls.append(
+            {"room_id": room_id, "message_id": message_id, "text": text}
+        )
+        return {"_id": message_id}
+
     @property
     def server_url(self):
         return "https://chat.example.com"
@@ -287,6 +302,37 @@ async def test_send_auth_error_stays_visible():
 
     assert not result.success
     assert result.error == "HTTP 401: Unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_send_zero_max_message_length_posts_single_message():
+    """ROCKETCHAT_MAX_MESSAGE_LENGTH=0 means no limit: one post, no chunking."""
+    client = FakeUploadClient()
+    cfg = RocketChatConfig(
+        server_url="https://chat.example.com",
+        auth_mode="token",
+        user_id="u1",
+        access_token="tok",
+        max_message_length=0,
+    )
+    adapter = RocketChatAdapter(cfg)
+    setattr(adapter, "_client", client)
+    adapter._connected = True
+
+    long_text = "x" * 5000
+    result = await adapter.send(chat_id="room-1", content=long_text)
+
+    assert result.success
+    assert client.post_message_calls[0]["text"] == long_text
+    assert len(client.post_message_calls) == 1
+
+
+def test_split_long_text_zero_or_negative_limit_does_not_loop():
+    """A 0/negative chunk limit must return one chunk, never spin."""
+    adapter = RocketChatAdapter(RocketChatConfig(server_url="https://chat.example.com"))
+    text = "x" * 100
+    assert adapter._split_long_text(text, 0) == [text]
+    assert adapter._split_long_text(text, -5) == [text]
 
 
 @pytest.mark.asyncio

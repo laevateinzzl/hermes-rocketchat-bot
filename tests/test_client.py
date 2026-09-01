@@ -17,10 +17,11 @@ from adapter import (
 class FakeResponse:
     """A minimal fake HTTP response for testing."""
 
-    def __init__(self, *, status=200, json_data=None, text_data=""):
+    def __init__(self, *, status=200, json_data=None, text_data="", headers=None):
         self.status = status
         self._json_data = json_data
         self._text = text_data
+        self.headers = headers or {}
 
     async def json(self):
         if self._json_data is None:
@@ -359,3 +360,167 @@ async def test_download_attachment_uses_auth_headers():
     assert "file-upload/abc/photo.jpg" in req["url"]
     assert req["headers"]["X-User-Id"] == "test-bot-id"
     assert req["headers"]["X-Auth-Token"] == "test-access-token"
+
+
+# ---------------------------------------------------------------------------
+# Multipart upload (0.3.0-A: real file bytes, not JSON metadata)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_attachment_sends_real_multipart_file():
+    """rooms.media must receive the actual file bytes as multipart form data."""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp.write(b"fake-image-bytes")
+        tmp_path = tmp.name
+
+    try:
+        session = FakeSession(
+            responses=[
+                # rooms.media
+                FakeResponse(
+                    json_data={"success": True, "file": {"_id": "f1", "name": "x.png"}}
+                ),
+                # rooms.mediaConfirm
+                FakeResponse(json_data={"success": True}),
+                # chat.postMessage
+                FakeResponse(json_data={"success": True, "message": {"_id": "m1"}}),
+            ]
+        )
+        client = FakeClient(session)
+
+        result = await client.upload_attachment(
+            room_id="room-1", file_path=tmp_path, text="caption", tmid="t-1"
+        )
+
+        assert result["_id"] == "m1"
+        media_call = session.requests[0]
+        assert "rooms.media" in media_call["url"]
+        # A real multipart payload (httpx-style files= for non-aiohttp fake
+        # sessions), NOT the old JSON metadata-only body.
+        assert "json" not in media_call
+        assert media_call["files"]["file"][0].endswith(".png")
+        assert media_call["files"]["file"][1] == b"fake-image-bytes"
+        assert media_call["files"]["file"][2] == "image/png"
+        # Credentials ride the default headers on every step.
+        assert media_call["headers"]["X-Auth-Token"] == "test-access-token"
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# download_attachment hardening (SSRF / credential hygiene)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_download_attachment_joins_relative_url():
+    """Relative /file-upload/... URLs are joined onto the server origin."""
+    session = FakeSession(responses=[FakeResponse(status=200, text_data=b"img")])
+    client = FakeClient(session)
+
+    data = await client.download_attachment("/file-upload/room-1/f1/notes.txt")
+
+    assert data == b"img"
+    req = session.requests[0]
+    assert req["url"] == "https://chat.example.com/file-upload/room-1/f1/notes.txt"
+    # Same-origin: bot credentials are attached.
+    assert req["headers"]["X-User-Id"] == "test-bot-id"
+    assert req["headers"]["X-Auth-Token"] == "test-access-token"
+
+
+@pytest.mark.asyncio
+async def test_download_attachment_cross_origin_drops_credentials(monkeypatch):
+    """Cross-origin https targets are fetched WITHOUT bot credentials."""
+
+    async def public(host):
+        return True
+
+    monkeypatch.setattr("adapter._host_is_public", public)
+    session = FakeSession(responses=[FakeResponse(status=200, text_data=b"x")])
+    client = FakeClient(session)
+
+    data = await client.download_attachment("https://cdn.example.net/f.png")
+
+    assert data == b"x"
+    req = session.requests[0]
+    assert "X-User-Id" not in req["headers"]
+    assert "X-Auth-Token" not in req["headers"]
+
+
+@pytest.mark.asyncio
+async def test_download_attachment_rejects_cross_origin_http():
+    """Cross-origin plain-http targets are refused (no credential leak)."""
+    session = FakeSession()
+    client = FakeClient(session)
+
+    with pytest.raises(RocketChatClientError, match="require https"):
+        await client.download_attachment("http://other.example.com/f.png")
+
+
+@pytest.mark.asyncio
+async def test_download_attachment_blocks_private_host(monkeypatch):
+    """Private/loopback cross-origin hosts are refused (SSRF guard)."""
+
+    async def private(host):
+        return False
+
+    monkeypatch.setattr("adapter._host_is_public", private)
+    session = FakeSession()
+    client = FakeClient(session)
+
+    with pytest.raises(RocketChatClientError, match="private"):
+        await client.download_attachment("https://169.254.169.254/latest/meta-data/")
+
+
+@pytest.mark.asyncio
+async def test_download_attachment_rejects_non_http_scheme():
+    session = FakeSession()
+    client = FakeClient(session)
+
+    with pytest.raises(RocketChatClientError, match="Unsupported attachment URL"):
+        await client.download_attachment("ftp://example.com/f.png")
+
+
+@pytest.mark.asyncio
+async def test_download_attachment_redirect_rechecked_and_unauthenticated(
+    monkeypatch,
+):
+    """Redirect hops are re-validated; cross-origin hops lose credentials."""
+
+    async def public(host):
+        return True
+
+    monkeypatch.setattr("adapter._host_is_public", public)
+    session = FakeSession(
+        responses=[
+            FakeResponse(status=302, headers={"Location": "https://cdn.example.net/f"}),
+            FakeResponse(status=200, text_data=b"final"),
+        ]
+    )
+    client = FakeClient(session)
+
+    data = await client.download_attachment(
+        "https://chat.example.com/file-upload/r/f/a.png"
+    )
+
+    assert data == b"final"
+    assert len(session.requests) == 2
+    # First hop: same-origin -> authenticated.
+    assert session.requests[0]["headers"]["X-Auth-Token"] == "test-access-token"
+    # Second hop: cross-origin -> no credentials, absolute https target.
+    assert "X-Auth-Token" not in session.requests[1]["headers"]
+    assert session.requests[1]["url"] == "https://cdn.example.net/f"
+
+
+@pytest.mark.asyncio
+async def test_download_attachment_enforces_size_cap():
+    session = FakeSession(responses=[FakeResponse(status=200, text_data=b"123456")])
+    client = FakeClient(session)
+    client._max_download_bytes = 4
+
+    with pytest.raises(RocketChatClientError, match="size limit"):
+        await client.download_attachment("https://chat.example.com/big.bin")

@@ -138,6 +138,10 @@ async def test_upload_attachment_calls_rooms_media_and_confirm():
         # Verify rooms.media was called
         media_call = session.requests[0]
         assert "rooms.media" in media_call["url"]
+        # Real multipart payload (httpx-style files= on fake sessions) —
+        # the old JSON-metadata-only upload would carry no files= key.
+        assert "json" not in media_call
+        assert "files" in media_call or "data" in media_call
 
         # Verify rooms.mediaConfirm was called
         confirm_call = session.requests[1]

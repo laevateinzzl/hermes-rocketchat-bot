@@ -221,6 +221,8 @@ async def test_resolve_media_text_attachment_not_inlined():
 
     assert len(media_urls) == 1
     assert media_types == ["document"]
+    # Relative /file-upload/... paths are absolutized against the server.
+    assert media_urls == ["http://rc/file-upload/room-1/f1/notes.txt"]
     assert media_text_inlined == [False]
 
 
