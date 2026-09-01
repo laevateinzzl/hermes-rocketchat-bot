@@ -678,3 +678,121 @@ async def test_max_attempts_stops_reconnecting():
     # _running should be False after giving up
     assert not transport._running
     assert "failed" in statuses
+
+
+# ---------------------------------------------------------------------------
+# 0.3.0-B: handshake hardening + subscription refresh
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_websocket_login_error_frame_raises_auth_error():
+    """A DDP login result carrying an error must raise (not silently blind)."""
+    ws = FakeWebSocket(
+        server_frames=[
+            _connected_frame(),
+            json.dumps(
+                {
+                    "msg": "result",
+                    "id": "1",
+                    "error": {
+                        "error": 403,
+                        "reason": "Forbidden",
+                        "message": "Invalid session",
+                        "errorType": "Meteor.Error",
+                    },
+                }
+            ),
+        ]
+    )
+    transport = WebSocketTransport(
+        client=FakeWSClient(),
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=_factory(ws),
+    )
+
+    transport._running = True
+    with pytest.raises(RocketChatClientError, match="resume token"):
+        await transport._handshake(ws)
+
+
+@pytest.mark.asyncio
+async def test_websocket_handshake_failed_frame_raises():
+    """DDP version-mismatch (failed frame) must not hang the handshake."""
+    ws = FakeWebSocket(server_frames=[json.dumps({"msg": "failed", "version": "2"})])
+    transport = WebSocketTransport(
+        client=FakeWSClient(),
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=_factory(ws),
+    )
+
+    transport._running = True
+    with pytest.raises(RocketChatClientError, match="DDP handshake failed"):
+        await transport._handshake(ws)
+
+
+@pytest.mark.asyncio
+async def test_websocket_handshake_has_timeout():
+    """A server that never answers must not hang the handshake forever."""
+
+    class HangingWebSocket:
+        async def send(self, data):
+            pass
+
+        async def recv(self):
+            await asyncio.sleep(30)
+
+    transport = WebSocketTransport(
+        client=FakeWSClient(),
+        ws_url="wss://chat.example.com/websocket",
+        receive_timeout=0.15,
+    )
+
+    transport._running = True
+    with pytest.raises(asyncio.TimeoutError):
+        await transport._handshake(HangingWebSocket())
+
+
+@pytest.mark.asyncio
+async def test_websocket_refresh_subscribes_to_new_room():
+    """Rooms/DMs created after connect get subscribed by the refresh pass."""
+    subscriptions = [{"rid": "room-1", "t": "c"}]
+    client = FakeWSClient(subscriptions=subscriptions)
+    ws = FakeWebSocket()
+    transport = WebSocketTransport(
+        client=client,
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=_factory(ws),
+    )
+
+    await transport._bootstrap_subscriptions(ws)
+    sub_frames = [f for f in ws.sent_frames if '"msg": "sub"' in f]
+    assert len(sub_frames) == 1
+
+    # A DM appears server-side after connect.
+    subscriptions.append({"rid": "dm-new", "t": "d"})
+    await transport._refresh_subscriptions(ws)
+
+    sub_frames = [f for f in ws.sent_frames if '"msg": "sub"' in f]
+    assert len(sub_frames) == 2
+    assert _decode_frame(sub_frames[1])["params"][0] == "dm-new"
+    # Room types cached for inbound tagging.
+    assert transport._room_types.get("dm-new") == "d"
+
+
+@pytest.mark.asyncio
+async def test_websocket_refresh_does_not_resubscribe_known_rooms():
+    subscriptions = [{"rid": "room-1", "t": "c"}]
+    client = FakeWSClient(subscriptions=subscriptions)
+    ws = FakeWebSocket()
+    transport = WebSocketTransport(
+        client=client,
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=_factory(ws),
+    )
+
+    await transport._bootstrap_subscriptions(ws)
+    await transport._refresh_subscriptions(ws)
+
+    sub_frames = [f for f in ws.sent_frames if '"msg": "sub"' in f]
+    assert len(sub_frames) == 1

@@ -34,6 +34,10 @@ optional_env:
     description: polling or websocket
     prompt: Transport
     password: false
+  - name: ROCKETCHAT_POLL_INTERVAL_SECONDS
+    description: Polling transport interval in seconds (default 3)
+    prompt: Poll interval seconds
+    password: false
   - name: ROCKETCHAT_MENTION_NAMES
     description: Comma-separated aliases that trigger the bot in rooms
     prompt: Mention aliases
@@ -81,6 +85,22 @@ optional_env:
   - name: ROCKETCHAT_RECONNECT_JITTER
     description: Jitter fraction (0-0.5) applied to each reconnect delay (default 0.25)
     prompt: Reconnect jitter
+    password: false
+  - name: ROCKETCHAT_SUBSCRIPTION_REFRESH_SECONDS
+    description: WebSocket resubscribe interval so rooms created after connect are picked up (default 300)
+    prompt: Subscription refresh seconds
+    password: false
+  - name: ROCKETCHAT_FORCE_THREAD
+    description: Always reply inside threads
+    prompt: Force threads
+    password: false
+  - name: ROCKETCHAT_MEDIA_CACHE_DIR
+    description: Directory for downloaded inbound attachments
+    prompt: Media cache directory
+    password: false
+  - name: ROCKETCHAT_MAX_MESSAGE_LENGTH
+    description: Max characters per message; longer replies are split (default 4000, 0 = no limit)
+    prompt: Max message length
     password: false
   - name: ROCKETCHAT_DEDUP_ENABLED
     description: Suppress replayed inbound messages after WebSocket reconnect (default true)

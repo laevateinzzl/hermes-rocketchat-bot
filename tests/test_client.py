@@ -524,3 +524,45 @@ async def test_download_attachment_enforces_size_cap():
 
     with pytest.raises(RocketChatClientError, match="size limit"):
         await client.download_attachment("https://chat.example.com/big.bin")
+
+
+# ---------------------------------------------------------------------------
+# 0.3.0-B: subscription delta + pagination
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_subscriptions_passes_params_and_pages():
+    """updatedSince must reach the server; >100-room bots must paginate."""
+    session = FakeSession(
+        responses=[
+            FakeResponse(
+                json_data={"update": [{"rid": f"r{i}", "t": "c"} for i in range(100)]}
+            ),
+            FakeResponse(json_data={"update": [{"rid": "r100", "t": "c"}]}),
+        ]
+    )
+    client = FakeClient(session)
+
+    subs = await client.list_subscriptions(updated_since="2024-01-01T00:00:00.000Z")
+
+    assert len(subs) == 101
+    first = session.requests[0]
+    assert first["params"]["count"] == 100
+    assert first["params"]["updatedSince"] == "2024-01-01T00:00:00.000Z"
+    assert session.requests[1]["params"]["offset"] == 100
+
+
+@pytest.mark.asyncio
+async def test_list_subscriptions_single_page_without_since():
+    session = FakeSession(
+        responses=[
+            FakeResponse(json_data={"subscriptions": [{"rid": "r1", "t": "c"}]}),
+        ]
+    )
+    client = FakeClient(session)
+
+    subs = await client.list_subscriptions()
+
+    assert len(subs) == 1
+    assert "updatedSince" not in session.requests[0]["params"]

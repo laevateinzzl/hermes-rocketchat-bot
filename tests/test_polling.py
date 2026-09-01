@@ -1,8 +1,15 @@
 """Tests for Rocket.Chat polling inbound transport."""
 
+import time
+
 import pytest
 
-from adapter import InMemoryCheckpointStore, PollingTransport, RocketChatRateLimitError
+from adapter import (
+    InMemoryCheckpointStore,
+    PollingTransport,
+    RocketChatClientError,
+    RocketChatRateLimitError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +239,7 @@ async def test_poll_deduplicates_seen_ids():
 
     transport = PollingTransport(client)
     transport.checkpoint_store.save("room1", "2023-01-01T00:00:00.000Z")
-    transport._seen_ids.add("dup-msg-1")  # already seen
+    transport._seen_ids["dup-msg-1"] = time.monotonic()  # already seen
 
     events = await transport.poll_once()
     assert len(events) == 0
@@ -300,3 +307,89 @@ async def test_poll_updates_checkpoint_after_poll():
     await transport.poll_once()
     # Checkpoint should be the subscription's _updatedAt
     assert transport.checkpoint_store.get("room1") == "2024-01-01T00:02:00.000Z"
+
+
+# ---------------------------------------------------------------------------
+# 0.3.0-B: polling re-authentication on credential failure
+# ---------------------------------------------------------------------------
+
+
+class AuthFailingPollClient(FakePollingClient):
+    """Fails auth once, then recovers — initialize() is a no-op success."""
+
+    def __init__(self):
+        super().__init__()
+        self.initialize_calls = 0
+        self.fail_first = True
+
+    async def initialize(self):
+        self.initialize_calls += 1
+        return True
+
+    async def list_subscriptions(self, updated_since=None):
+        if self.fail_first:
+            self.fail_first = False
+            raise RocketChatClientError(
+                "Token verification failed: HTTP 401: Unauthorized"
+            )
+        return []
+
+
+@pytest.mark.asyncio
+async def test_poll_reauthenticates_on_auth_failure():
+    """A definitive 401 during polling must trigger one re-auth attempt."""
+    import asyncio
+
+    client = AuthFailingPollClient()
+    fatal: list[str] = []
+    transport = PollingTransport(
+        client,
+        poll_interval=0.01,
+        on_auth_failure=lambda m: fatal.append(m),
+    )
+    transport._running = True
+
+    task = asyncio.create_task(transport._poll_loop())
+    await asyncio.sleep(0.1)
+    transport._running = False
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    assert client.initialize_calls >= 1
+    assert fatal == []  # re-auth succeeded → no fatal reported
+
+
+@pytest.mark.asyncio
+async def test_poll_reports_fatal_when_reauth_fails():
+    """If re-authentication keeps failing, the fatal callback must fire."""
+    import asyncio
+
+    class AlwaysFailingClient(FakePollingClient):
+        async def initialize(self):
+            raise RocketChatClientError("HTTP 401: Unauthorized")
+
+        async def list_subscriptions(self, updated_since=None):
+            raise RocketChatClientError("HTTP 401: Unauthorized")
+
+    client = AlwaysFailingClient()
+    fatal: list[str] = []
+    transport = PollingTransport(
+        client,
+        poll_interval=0.01,
+        on_auth_failure=lambda m: fatal.append(m),
+    )
+    transport._running = True
+
+    task = asyncio.create_task(transport._poll_loop())
+    await asyncio.sleep(0.1)
+    transport._running = False
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    assert len(fatal) >= 1

@@ -139,6 +139,13 @@ ROCKETCHAT_RECONNECT_MAX_ATTEMPTS=0   # 0 = retry forever
 ROCKETCHAT_RECONNECT_JITTER=0.25      # ±25% randomization
 ```
 
+**New-room subscription refresh:** rooms and DMs created *after* the bot
+connected are re-subscribed automatically: the transport re-fetches
+subscriptions every `ROCKETCHAT_SUBSCRIPTION_REFRESH_SECONDS` (default `300`,
+min `10`) and subscribes to anything new. Messages from rooms the transport
+has never tagged fall back to a `rooms.info` lookup so a fresh DM is never
+mis-gated as a channel.
+
 ### Inbound dedup (WebSocket)
 
 When the WebSocket reconnects (or the gateway restarts), Rocket.Chat's
@@ -227,7 +234,8 @@ user-to-DM resolution).
 ```bash
 ROCKETCHAT_FORCE_THREAD=true          # always reply in threads
 ROCKETCHAT_MEDIA_CACHE_DIR=/var/lib/hermes/rocketchat-media
-ROCKETCHAT_MAX_MESSAGE_LENGTH=4000    # max chars per message (longer replies are split)
+ROCKETCHAT_MAX_MESSAGE_LENGTH=4000    # max chars per message (longer replies are split; 0 = no limit)
+ROCKETCHAT_POLL_INTERVAL_SECONDS=3    # polling transport interval
 ```
 
 ## Live streaming, tool status & long replies

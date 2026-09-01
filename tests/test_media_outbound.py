@@ -12,7 +12,12 @@ from pathlib import Path
 
 import pytest  # type: ignore[reportMissingImports]
 
-from adapter import RocketChatAdapter, RocketChatConfig, RocketChatClientError
+from adapter import (
+    RocketChatAdapter,
+    RocketChatClientError,
+    RocketChatConfig,
+    RocketChatRateLimitError,
+)
 
 
 class FakeUploadClient:
@@ -481,3 +486,88 @@ async def test_send_multiple_images_skips_bad_sources(media_file, monkeypatch):
 
     assert len(client.uploads) == 1
     assert results[1].success is False
+
+
+# ---------------------------------------------------------------------------
+# 0.3.0-B: chunked-send semantics, rate limits, placeholder lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_partial_failure_returns_final_error_with_last_id():
+    """A mid-chunk failure must report final error + last chunk id, never
+    the replayable send_path_degraded code (which would duplicate the
+    already-posted prefix on replay)."""
+
+    class PartialFailClient(FakeUploadClient):
+        def __init__(self):
+            super().__init__()
+            self._posts = 0
+
+        async def post_message(self, room_id, text, tmid=""):
+            self._posts += 1
+            if self._posts >= 2:
+                raise RocketChatClientError("connection reset by peer")
+            return {"_id": f"m{self._posts}"}
+
+    cfg = RocketChatConfig(
+        server_url="https://chat.example.com",
+        auth_mode="token",
+        user_id="u1",
+        access_token="tok",
+        max_message_length=10,
+    )
+    adapter = RocketChatAdapter(cfg)
+    setattr(adapter, "_client", PartialFailClient())
+    adapter._connected = True
+
+    result = await adapter.send(chat_id="room-1", content="x" * 30)
+
+    assert not result.success
+    assert result.error == "connection reset by peer"
+    assert result.message_id == "m1"
+
+
+@pytest.mark.asyncio
+async def test_send_rate_limit_maps_to_send_path_degraded():
+    """Outbound 429s are transient — the ledger must replay them."""
+
+    class RateLimitedClient(FakeUploadClient):
+        async def post_message(self, room_id, text, tmid=""):
+            raise RocketChatRateLimitError(
+                "HTTP 429: Too Many Requests", retry_after=1.0
+            )
+
+    adapter = _make_adapter(RateLimitedClient())
+
+    result = await adapter.send(chat_id="room-1", content="hello")
+
+    assert not result.success
+    assert result.error == "send_path_degraded"
+
+
+@pytest.mark.asyncio
+async def test_send_typing_post_failure_is_swallowed():
+    """A failed placeholder creation must not crash the streaming turn."""
+
+    class TypingFailClient(FakeUploadClient):
+        async def post_message(self, room_id, text, tmid=""):
+            raise RocketChatClientError("room deleted")
+
+    adapter = _make_adapter(TypingFailClient())
+
+    # Must not raise.
+    await adapter.send_typing(chat_id="room-1")
+
+
+@pytest.mark.asyncio
+async def test_stop_typing_scoped_to_thread_with_metadata():
+    """stop_typing with metadata must not clear other threads' previews."""
+    adapter = _make_adapter()
+    adapter._stream_previews["room-1\u0000thread-9"] = "m9"
+    adapter._stream_previews["room-1\u0000thread-2"] = "m2"
+
+    await adapter.stop_typing("room-1", {"thread_id": "thread-9"})
+
+    assert "room-1\u0000thread-9" not in adapter._stream_previews
+    assert "room-1\u0000thread-2" in adapter._stream_previews

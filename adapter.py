@@ -48,6 +48,7 @@ class RocketChatConfig:
     # Reconnect / heartbeat tuning (WebSocket transport)
     receive_timeout: float = 60.0
     ping_timeout: float = 10.0
+    subscription_refresh_seconds: float = 300.0
     reconnect_initial_delay: float = 1.0
     reconnect_max_delay: float = 60.0
     reconnect_max_attempts: int = 0  # 0 = unlimited
@@ -159,6 +160,11 @@ def parse_config(extra: dict[str, Any] | None = None) -> RocketChatConfig:
             extra.get("ping_timeout")
             or os.environ.get("ROCKETCHAT_PING_TIMEOUT", "10"),
             10.0,
+        ),
+        subscription_refresh_seconds=_parse_float_safe(
+            extra.get("subscription_refresh_seconds")
+            or os.environ.get("ROCKETCHAT_SUBSCRIPTION_REFRESH_SECONDS", "300"),
+            300.0,
         ),
         reconnect_initial_delay=_parse_float_safe(
             extra.get("reconnect_initial_delay")
@@ -558,9 +564,13 @@ class RocketChatClient:
         self._username = username
         self._password = password
         self._identity: RocketChatIdentity | None = None
+        # Cached HTTP session (lazy, shared by _request / download_attachment).
+        self._session: Any = None
         # Bounds for inbound attachment downloads (SSRF/DoS hardening).
         self._download_timeout = 30.0
         self._max_download_bytes = 64 * 1024 * 1024
+        # Default timeout for every REST call via _request().
+        self._request_timeout = 30.0
 
     @property
     def identity(self) -> RocketChatIdentity | None:
@@ -573,15 +583,51 @@ class RocketChatClient:
     # -- subclasses / tests override this to inject fake HTTP sessions --------
 
     async def _get_session(self):
-        """Return an aiohttp ClientSession (lazy import to keep deps optional)."""
+        """Return the cached HTTP session (lazy import to keep deps optional).
+
+        One session per client is reused for every REST call and attachment
+        download so aiohttp/httpx connection pooling (keep-alive, TLS resumption)
+        actually applies — instead of a fresh TCP+TLS handshake per request.
+        """
+        if (
+            self._session is None
+            or getattr(self._session, "closed", False)
+            or getattr(self._session, "is_closed", False)
+        ):
+            try:
+                import aiohttp  # type: ignore[reportMissingImports]
+
+                self._session = aiohttp.ClientSession()
+            except ImportError:
+                import httpx  # type: ignore[import-not-found]
+
+                self._session = httpx.AsyncClient()
+        return self._session
+
+    async def close(self) -> None:
+        """Close the cached HTTP session (idempotent)."""
+        session = self._session
+        self._session = None
+        if session is None:
+            return
+        try:
+            closer = getattr(session, "aclose", None) or getattr(session, "close", None)
+            if closer is not None:
+                await _maybe_await(closer())
+        except Exception:
+            pass
+
+    def _timeout_kwargs(self, session: Any, seconds: float) -> dict[str, Any]:
+        """Build backend-specific ``timeout=`` kwargs for a request."""
         try:
             import aiohttp  # type: ignore[reportMissingImports]
 
-            return aiohttp.ClientSession()
+            if isinstance(session, aiohttp.ClientSession):
+                return {"timeout": aiohttp.ClientTimeout(total=seconds)}
         except ImportError:
-            import httpx  # type: ignore[import-not-found]
-
-            return httpx.AsyncClient()
+            pass
+        # httpx accepts a plain float.
+        return {"timeout": max(0.1, seconds)}
 
     async def _request(
         self,
@@ -609,46 +655,42 @@ class RocketChatClient:
 
         session = await self._get_session()
 
-        async with session:
-            if multipart is not None:
-                request_kwargs = _multipart_request_kwargs(
-                    session,
-                    multipart["file_path"],
-                    multipart.get("filename", ""),
-                    multipart.get("content_type", "application/octet-stream"),
-                )
-            else:
-                request_kwargs = {"json": json, "params": params}
-            resp = await _maybe_await(
-                session.request(method, url, headers=default_headers, **request_kwargs)
+        if multipart is not None:
+            request_kwargs = _multipart_request_kwargs(
+                session,
+                multipart["file_path"],
+                multipart.get("filename", ""),
+                multipart.get("content_type", "application/octet-stream"),
             )
-            status = getattr(resp, "status", getattr(resp, "status_code", None))
-            if raw:
-                read_fn = resp.aread if hasattr(resp, "aread") else resp.read
-                body = await _maybe_await(read_fn())
-                if status is not None and status >= 400:
-                    raise RocketChatClientError(
-                        f"{method} {path} failed: HTTP {status}"
-                    )
-                return body
-
+        else:
+            request_kwargs = {"json": json, "params": params}
+        request_kwargs.update(self._timeout_kwargs(session, self._request_timeout))
+        resp = await _maybe_await(
+            session.request(method, url, headers=default_headers, **request_kwargs)
+        )
+        status = getattr(resp, "status", getattr(resp, "status_code", None))
+        if raw:
+            read_fn = resp.aread if hasattr(resp, "aread") else resp.read
+            body = await _maybe_await(read_fn())
             if status is not None and status >= 400:
-                body = await _response_text(resp)
-                message = f"{method} {path} failed: HTTP {status}: {body[:200]}"
-                if status == 429:
-                    headers_obj = getattr(resp, "headers", None)
-                    retry_header = (
-                        headers_obj.get("Retry-After")
-                        if headers_obj is not None
-                        else None
-                    )
-                    retry_after = _parse_retry_after(retry_header or body)
-                    raise RocketChatRateLimitError(message, retry_after=retry_after)
-                if status == 404:
-                    raise RocketChatNotFoundError(message)
-                raise RocketChatClientError(message)
+                raise RocketChatClientError(f"{method} {path} failed: HTTP {status}")
+            return body
 
-            return await _maybe_await(resp.json())
+        if status is not None and status >= 400:
+            body = await _response_text(resp)
+            message = f"{method} {path} failed: HTTP {status}: {body[:200]}"
+            if status == 429:
+                headers_obj = getattr(resp, "headers", None)
+                retry_header = (
+                    headers_obj.get("Retry-After") if headers_obj is not None else None
+                )
+                retry_after = _parse_retry_after(retry_header or body)
+                raise RocketChatRateLimitError(message, retry_after=retry_after)
+            if status == 404:
+                raise RocketChatNotFoundError(message)
+            raise RocketChatClientError(message)
+
+        return await _maybe_await(resp.json())
 
     # -- authentication ------------------------------------------------------
 
@@ -806,12 +848,28 @@ class RocketChatClient:
         return str(room.get("_id") or "")
 
     async def list_subscriptions(self, updated_since=None) -> list[dict]:
-        """List subscriptions via /api/v1/subscriptions.get."""
-        params = {}
-        if updated_since:
-            params["updatedSince"] = updated_since
-        data = await self._request("GET", "/api/v1/subscriptions.get")
-        return data.get("update", data.get("subscriptions", []))
+        """List subscriptions via /api/v1/subscriptions.get.
+
+        Passes ``updatedSince`` when given (server-side delta) and pages
+        through the whole result set so bots in >50 rooms are not silently
+        truncated by the server's default page size.
+        """
+        all_items: list[dict] = []
+        offset = 0
+        page_size = 100
+        while True:
+            params: dict[str, Any] = {"count": page_size, "offset": offset}
+            if updated_since:
+                params["updatedSince"] = updated_since
+            data = await self._request(
+                "GET", "/api/v1/subscriptions.get", params=params
+            )
+            items = data.get("update", data.get("subscriptions", []))
+            all_items.extend(items or [])
+            if not items or len(items) < page_size:
+                break
+            offset += page_size
+        return all_items
 
     async def sync_messages(
         self,
@@ -923,27 +981,26 @@ class RocketChatClient:
                 "allow_redirects" if uses_aiohttp else "follow_redirects"
             ] = False
 
-            async with session:
-                resp = await _resolve_with_timeout(
-                    session.get(target, headers=headers, **redirect_kwargs),
-                    self._download_timeout,
-                )
-                if resp.status in (301, 302, 303, 307, 308) and resp.headers.get(
-                    "Location"
-                ):
-                    from urllib.parse import urljoin
+            resp = await _resolve_with_timeout(
+                session.get(target, headers=headers, **redirect_kwargs),
+                self._download_timeout,
+            )
+            if resp.status in (301, 302, 303, 307, 308) and resp.headers.get(
+                "Location"
+            ):
+                from urllib.parse import urljoin
 
-                    target = urljoin(target, resp.headers["Location"])
-                    continue
-                resp.raise_for_status()
-                read_fn = resp.aread if hasattr(resp, "aread") else resp.read
-                data = await _resolve_with_timeout(read_fn(), self._download_timeout)
-                if len(data) > self._max_download_bytes:
-                    raise RocketChatClientError(
-                        f"Attachment download exceeds size limit "
-                        f"({self._max_download_bytes} bytes)"
-                    )
-                return data
+                target = urljoin(target, resp.headers["Location"])
+                continue
+            resp.raise_for_status()
+            read_fn = resp.aread if hasattr(resp, "aread") else resp.read
+            data = await _resolve_with_timeout(read_fn(), self._download_timeout)
+            if len(data) > self._max_download_bytes:
+                raise RocketChatClientError(
+                    f"Attachment download exceeds size limit "
+                    f"({self._max_download_bytes} bytes)"
+                )
+            return data
 
         raise RocketChatClientError(f"Too many attachment redirects: {str(url)[:120]}")
 
@@ -1207,6 +1264,15 @@ class InMemoryCheckpointStore:
         """Return the last seen timestamp for a room, or 0 if never seen."""
         return self._checkpoints.get(room_id, 0)
 
+    def oldest(self):
+        """Return the oldest checkpoint across rooms (or None if empty).
+
+        Used as the ``updatedSince`` delta for ``subscriptions.get`` so the
+        server-side filter covers every room the bot knows about.
+        """
+        values = [v for v in self._checkpoints.values() if v]
+        return min(values) if values else None
+
     def save(self, room_id: str, updated_at):
         """Store the latest timestamp for a room."""
         self._checkpoints[room_id] = updated_at
@@ -1339,14 +1405,15 @@ class PollingTransport:
     on a configurable interval.
     """
 
-    def __init__(self, client, poll_interval: float = 3.0):
+    def __init__(self, client, poll_interval: float = 3.0, on_auth_failure: Any = None):
         self._client = client
         self.poll_interval = poll_interval
         self.checkpoint_store = InMemoryCheckpointStore()
-        self._seen_ids: set[str] = set()
+        self._seen_ids: BoundedDict[str, float] = BoundedDict(maxsize=100_000)
         self._running = False
         self._task: Any = None
         self._on_message: Any = None
+        self._on_auth_failure: Any = on_auth_failure
 
     def set_on_message(self, callback):
         """Register a callback for inbound messages."""
@@ -1381,6 +1448,9 @@ class PollingTransport:
     async def _poll_loop(self):
         """Repeatedly poll while running."""
         import asyncio
+        import logging
+
+        log = logging.getLogger(__name__)
 
         while self._running:
             try:
@@ -1389,28 +1459,50 @@ class PollingTransport:
                     for event in events:
                         await self._on_message(event)
             except RocketChatRateLimitError as exc:
-                import logging
-
                 delay = self._sleep_after_error(exc)
-                logging.getLogger(__name__).warning(
+                log.warning(
                     "Rocket.Chat polling rate limited; backing off for %.1f seconds",
                     delay,
                 )
                 await asyncio.sleep(delay)
                 continue
-            except Exception:
-                import logging
-
-                logging.getLogger(__name__).exception("Polling error")
+            except Exception as exc:
+                # Definitive auth failure (401/invalid token): the credential
+                # may have rotated server-side — try re-authenticating once
+                # before giving up; a still-invalid credential is reported as
+                # a fatal error so the gateway exits instead of logging 401s
+                # forever with no recovery path.
+                if _is_auth_failure_message(str(exc)):
+                    log.warning("Polling auth failure (%s); re-authenticating", exc)
+                    try:
+                        await self._client.initialize()
+                        log.info("Re-authentication succeeded")
+                    except Exception as reauth_exc:
+                        log.exception("Re-authentication failed: %s", reauth_exc)
+                        callback = self._on_auth_failure
+                        if callable(callback):
+                            try:
+                                callback(str(reauth_exc))
+                            except Exception:
+                                pass
+                        await asyncio.sleep(self.poll_interval)
+                        continue
+                else:
+                    log.exception("Polling error")
             await asyncio.sleep(self.poll_interval)
 
     async def poll_once(self) -> list[dict]:
         """Execute one poll cycle and return new inbound events."""
+        import time
+
         events: list[dict] = []
 
         # 1. Get subscriptions updated since last check
         updates: list[tuple[str, dict]] = []
-        subscriptions = await self._client.list_subscriptions()
+        oldest_checkpoint = self.checkpoint_store.oldest()
+        subscriptions = await self._client.list_subscriptions(
+            updated_since=oldest_checkpoint
+        )
         for sub in subscriptions or []:
             room_id = sub.get("rid") or sub.get("_id", "")
             if not room_id:
@@ -1456,7 +1548,7 @@ class PollingTransport:
                 room_type = sub.get("t", "")
                 msg["_room_type"] = room_type
 
-                self._seen_ids.add(msg_id)
+                self._seen_ids[msg_id] = time.monotonic()
                 events.append(msg)
 
             # Advance checkpoint to subscription _updatedAt
@@ -1684,6 +1776,7 @@ class WebSocketTransport:
         reconnect_max_attempts: int = 0,
         reconnect_jitter: float = 0.25,
         on_auth_failure: Any = None,
+        subscription_refresh_seconds: float = 300.0,
     ):
         self._client = client
         self.ws_url = ws_url or _ws_url(client.server_url)
@@ -1693,10 +1786,21 @@ class WebSocketTransport:
         self._on_auth_failure: Any = on_auth_failure
         self._running = False
         self._task: asyncio.Task[Any] | None = None
-        self._seen_ids: set[str] = set()
-        self._sub_ids: set[str] = set()
+        # Bounded in-memory dedup / room / subscription registries so a
+        # long-running gateway stays flat (BoundedDict evicts oldest first).
+        self._seen_ids: BoundedDict[str, float] = BoundedDict(maxsize=100_000)
+        self._sub_ids: BoundedDict[str, float] = BoundedDict(maxsize=4_000)
         # Cache room type from subscriptions so we can tag inbound events
-        self._room_types: dict[str, str] = {}
+        self._room_types: BoundedDict[str, str] = BoundedDict(maxsize=5_000)
+        # Rooms we have subscribed stream-room-messages for on the CURRENT
+        # connection (reset on reconnect so bootstrap re-subscribes).
+        self._subscribed_rooms: set[str] = set()
+        # Periodic subscription refresh so rooms/DMs created after connect
+        # are picked up without a reconnect.
+        self._subscription_refresh_seconds = max(
+            10.0, _parse_float_safe(subscription_refresh_seconds, 300.0)
+        )
+        self._subscription_refresh_task: asyncio.Task[Any] | None = None
         # Heartbeat / reconnect tuning (defensive: config may already be parsed)
         self._receive_timeout = max(0.01, _parse_float_safe(receive_timeout, 60.0))
         self._ping_timeout = max(0.01, _parse_float_safe(ping_timeout, 10.0))
@@ -1815,6 +1919,9 @@ class WebSocketTransport:
                 ws = await self._ws_factory()
                 await self._handshake(ws)
                 await self._bootstrap_subscriptions(ws)
+                self._subscription_refresh_task = asyncio.create_task(
+                    self._subscription_refresh_loop(ws)
+                )
 
                 # Successful connect: reset backoff and notify
                 self._reconnect_attempts = 0
@@ -1827,6 +1934,15 @@ class WebSocketTransport:
             except Exception as exc:
                 await self._handle_connection_error(exc, log)
             finally:
+                refresh_task = self._subscription_refresh_task
+                self._subscription_refresh_task = None
+                if refresh_task is not None:
+                    refresh_task.cancel()
+                    try:
+                        await refresh_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                self._subscribed_rooms.clear()
                 if ws is not None:
                     try:
                         await ws.close()
@@ -1955,13 +2071,17 @@ class WebSocketTransport:
 
         # 2. Wait for "connected"
         while self._running:
-            frame = await _ws_recv_text(ws)
+            frame = await asyncio.wait_for(_ws_recv_text(ws), self._receive_timeout)
             msg = _decode_ddp_frame(frame)
             if msg is None:
                 continue
 
             if msg.get("msg") == "connected":
                 break
+            if msg.get("msg") == "failed":
+                raise RocketChatClientError(
+                    f"DDP handshake failed (version mismatch): {str(msg)[:200]}"
+                )
             if msg.get("msg") == "ping":
                 await _ws_send_text(ws, json.dumps({"msg": "pong"}))
 
@@ -1980,24 +2100,59 @@ class WebSocketTransport:
 
         # 4. Wait for login result
         while self._running:
-            frame = await _ws_recv_text(ws)
+            frame = await asyncio.wait_for(_ws_recv_text(ws), self._receive_timeout)
             msg = _decode_ddp_frame(frame)
             if msg is None:
                 continue
 
             if msg.get("msg") == "result" and msg.get("id") == "1":
+                if msg.get("error"):
+                    # Resume tokens die (server restart, token rotation).
+                    # Surface it as an auth error so the normal re-auth /
+                    # fatal-error plumbing runs instead of a silent dead socket.
+                    error = msg.get("error") or {}
+                    detail = (
+                        error.get("message") or error.get("error") or str(error)[:200]
+                        if isinstance(error, dict)
+                        else str(error)[:200]
+                    )
+                    raise RocketChatClientError(
+                        f"DDP login failed (resume token rejected): {detail}"
+                    )
                 break
             if msg.get("msg") == "ping":
                 await _ws_send_text(ws, json.dumps({"msg": "pong"}))
 
     # -- subscriptions --------------------------------------------------------
 
-    async def _bootstrap_subscriptions(self, ws: Any) -> None:
-        """Subscribe to ``stream-room-messages`` for every joined room."""
+    async def _subscription_refresh_loop(self, ws: Any) -> None:
+        """Periodically subscribe to rooms/DMs created after connect."""
+        import logging
+
+        log = logging.getLogger(__name__)
+        while self._running and not getattr(ws, "closed", False):
+            await asyncio.sleep(self._subscription_refresh_seconds)
+            try:
+                await self._refresh_subscriptions(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning(
+                    "Rocket.Chat subscription refresh failed; will retry later",
+                    exc_info=True,
+                )
+
+    async def _refresh_subscriptions(self, ws: Any) -> None:
+        """Fetch subscriptions and subscribe to any new rooms.
+
+        Also refreshes the cached room-type map used to tag inbound events.
+        """
+        import time
+
         subscriptions = await self._client.list_subscriptions()
         for sub in subscriptions or []:
             room_id = sub.get("rid") or sub.get("_id", "")
-            if not room_id:
+            if not room_id or room_id in self._subscribed_rooms:
                 continue
 
             # Cache room type
@@ -2006,7 +2161,8 @@ class WebSocketTransport:
                 self._room_types[room_id] = room_type
 
             sub_id = f"sub-{room_id}"
-            self._sub_ids.add(sub_id)
+            self._sub_ids[sub_id] = time.monotonic()
+            self._subscribed_rooms.add(room_id)
             await _ws_send_text(
                 ws,
                 json.dumps(
@@ -2018,6 +2174,10 @@ class WebSocketTransport:
                     }
                 ),
             )
+
+    async def _bootstrap_subscriptions(self, ws: Any) -> None:
+        """Subscribe to ``stream-room-messages`` for every joined room."""
+        await self._refresh_subscriptions(ws)
 
     # -- frame dispatch -------------------------------------------------------
 
@@ -2047,11 +2207,13 @@ class WebSocketTransport:
         message = args[0]
         msg_id = message.get("_id", "")
 
-        # Deduplicate
+        # Deduplicate (bounded: oldest seen ids are evicted first)
+        import time
+
         if msg_id and msg_id in self._seen_ids:
             return
         if msg_id:
-            self._seen_ids.add(msg_id)
+            self._seen_ids[msg_id] = time.monotonic()
 
         # Attach room type from cached subscriptions
         room_id = message.get("rid", "")
@@ -2132,6 +2294,8 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         self._reply_cache: BoundedDict[str, dict[str, Any]] = BoundedDict(maxsize=200)
         self._cfg: RocketChatConfig | None = None
         self._seen_id_store: PersistentSeenIdStore | None = None
+        # Monotonic timestamp of the last seen-id disk flush (throttled).
+        self._last_dedup_flush = 0.0
 
         super().__init__(config=config, platform=_resolve_hermes_platform())
 
@@ -2264,6 +2428,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 reconnect_max_attempts=self._cfg.reconnect_max_attempts,
                 reconnect_jitter=self._cfg.reconnect_jitter,
                 on_auth_failure=self._mark_auth_fatal,
+                subscription_refresh_seconds=self._cfg.subscription_refresh_seconds,
             )
             # Surface connection status in the adapter log for observability
             self._transport.set_on_status(self._on_transport_status)
@@ -2271,6 +2436,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             self._transport = PollingTransport(
                 client=self._client,
                 poll_interval=self._cfg.poll_interval_seconds,
+                on_auth_failure=self._mark_auth_fatal,
             )
 
         # Wire inbound callback
@@ -2299,6 +2465,23 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         if self._transport is not None:
             await self._transport.stop()
             self._transport = None
+        # Force-persist any pending seen-ids (the periodic flush is throttled).
+        if self._seen_id_store is not None:
+            try:
+                self._seen_id_store.flush()
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).exception(
+                    "Failed to flush seen-id store on disconnect"
+                )
+        if self._client is not None:
+            closer = getattr(self._client, "close", None)
+            if callable(closer):
+                try:
+                    await closer()
+                except Exception:
+                    pass
         self._connected = False
         self._running = False
 
@@ -2326,19 +2509,20 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
 
     def _should_consume_typing_placeholder(
         self,
+        key: str,
         metadata: dict[str, Any] | None = None,
     ) -> bool:
         """Return True when a send may take over the thinking placeholder.
 
-        ``notify`` marks the final user-visible reply (legacy contract);
-        ``expect_edits`` marks the first chunk of a streamed reply that the
-        stream consumer will grow with edit_message().  In both cases the
-        placeholder message is edited in place so the user sees one message
-        instead of a placeholder plus a duplicate bubble.
+        Any existing placeholder is consumable — including on final
+        (non-streamed) sends — so a "💭 Thinking…" bubble never survives as
+        a ghost next to the real reply.  The one exclusion is a live stream
+        preview for the same (chat, thread): the growing preview IS the
+        indicator and must not be replaced.
         """
-        if not isinstance(metadata, dict):
+        if key in self._stream_previews:
             return False
-        return bool(metadata.get("notify") or metadata.get("expect_edits"))
+        return key in self._typing_placeholders
 
     def _render_status_phrase(self, chat_id: str) -> str:
         """Return the placeholder text for a chat, embedding any live status.
@@ -2390,24 +2574,45 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                     pass
             return
 
-        result = await self._client.post_message(
-            room_id=chat_id,
-            text=status_text,
-            tmid=self._metadata_thread_id(metadata),
-        )
+        try:
+            result = await self._client.post_message(
+                room_id=chat_id,
+                text=status_text,
+                tmid=self._metadata_thread_id(metadata),
+            )
+        except RocketChatClientError:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "[rocketchat] send_typing failed to create thinking placeholder",
+                exc_info=True,
+            )
+            return
         message_id = str(result.get("_id") or "")
         if message_id:
             self._typing_placeholders[key] = message_id
             self._last_status_text[key] = status_text
 
-    async def stop_typing(self, chat_id: str) -> None:
-        """Clear stream-preview markers for the chat so the next turn can
-        create a fresh thinking placeholder.
+    async def stop_typing(
+        self,
+        chat_id: str,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Clear stream-preview markers so the next turn can start fresh.
 
         The placeholder message itself is kept: the final send edits it
         (Hermes calls stop_typing after the agent finishes but before the
         final response is delivered).
+
+        With ``metadata`` the cleanup is scoped to the exact (chat, thread);
+        without it (the base signature), all threads of the chat are cleared
+        for backward compatibility.
         """
+        if metadata is not None:
+            key = self._typing_placeholder_key(chat_id, metadata)
+            self._stream_previews.pop(key, None)
+            return
         prefix = f"{chat_id}\u0000"
         for key in [k for k in self._stream_previews if k.startswith(prefix)]:
             self._stream_previews.pop(key, None)
@@ -2454,17 +2659,32 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             placeholder_id = self._typing_placeholders.get(placeholder_key)
 
             first_message_id = ""
+            posted_any = False
             for index, chunk in enumerate(chunks):
                 if (
                     index == 0
                     and placeholder_id
-                    and self._should_consume_typing_placeholder(metadata)
-                ):
-                    result = await self._client.update_message(
-                        room_id=chat_id,
-                        message_id=placeholder_id,
-                        text=chunk,
+                    and self._should_consume_typing_placeholder(
+                        placeholder_key, metadata
                     )
+                ):
+                    try:
+                        result = await self._client.update_message(
+                            room_id=chat_id,
+                            message_id=placeholder_id,
+                            text=chunk,
+                        )
+                    except RocketChatClientError:
+                        # The placeholder vanished (edited/deleted elsewhere):
+                        # drop the dead key and fall back to a fresh post so
+                        # the reply still arrives.
+                        self._typing_placeholders.pop(placeholder_key, None)
+                        self._last_status_text.pop(placeholder_key, None)
+                        result = await self._client.post_message(
+                            room_id=chat_id,
+                            text=chunk,
+                            tmid=tmid,
+                        )
                     self._typing_placeholders.pop(placeholder_key, None)
                     # First chunk of a streamed reply: remember the message id
                     # so edit_message() edits it and send_typing() stays quiet.
@@ -2481,13 +2701,26 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                     )
                     if not first_message_id:
                         first_message_id = result.get("_id", "")
+                posted_any = True
 
             return SendResult(
                 success=True,
                 message_id=first_message_id,
             )
         except RocketChatClientError as exc:
-            if _is_transient_client_error(str(exc)):
+            if posted_any:
+                # Partial delivery: report a FINAL failure carrying the last
+                # posted chunk id.  The `send_path_degraded` replay code must
+                # NOT be used here — the ledger would re-send the whole
+                # message and duplicate the already-posted prefix.
+                return SendResult(
+                    success=False,
+                    error=str(exc),
+                    message_id=first_message_id,
+                )
+            if isinstance(exc, RocketChatRateLimitError) or _is_transient_client_error(
+                str(exc)
+            ):
                 return SendResult(
                     success=False,
                     error="send_path_degraded",
@@ -2497,6 +2730,12 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 error=str(exc),
             )
         except Exception as exc:
+            if posted_any:
+                return SendResult(
+                    success=False,
+                    error=f"Unexpected error: {exc}",
+                    message_id=first_message_id,
+                )
             return SendResult(
                 success=False,
                 error=f"Unexpected error: {exc}",
@@ -2678,7 +2917,9 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 message_id=str(result.get("_id", "")),
             )
         except RocketChatClientError as exc:
-            if _is_transient_client_error(str(exc)):
+            if isinstance(exc, RocketChatRateLimitError) or _is_transient_client_error(
+                str(exc)
+            ):
                 return SendResult(
                     success=False,
                     error="send_path_degraded",
@@ -2963,6 +3204,24 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         if room_type is None:
             room_type = str(event.get("_room_type") or "")
 
+        # Room-type fallback: when the transport could not tag the room
+        # (e.g. a DM created after the WebSocket subscribed), resolve it via
+        # rooms.info so DMs are not mis-gated as channels.  Cached room
+        # metadata doubles as get_chat_info()'s data source.
+        if not room_type and self._client is not None:
+            rid = str(event.get("rid") or "")
+            if rid:
+                room = self._room_info.get(rid)
+                if room is None:
+                    try:
+                        room = await self._client.room_info(rid)
+                        self._room_info[rid] = (
+                            dict(room) if isinstance(room, dict) else {}
+                        )
+                    except (RocketChatClientError, AttributeError):
+                        self._room_info[rid] = {}
+                room_type = str(((room or {}).get("t", "")) or "")
+
         # Map Rocket.Chat room type codes to Hermes chat types
         chat_type = _rc_room_type_to_chat_type(room_type)
 
@@ -3001,7 +3260,15 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 return
             if msg_id:
                 self._seen_id_store.mark(msg_id)
-                self._seen_id_store.flush()
+                # Throttled persistence: a full-file write per message would
+                # dominate a busy room; flush at most every 2 seconds and
+                # force-persist on disconnect().
+                import time as _time
+
+                now = _time.monotonic()
+                if now - self._last_dedup_flush >= 2.0:
+                    self._seen_id_store.flush()
+                    self._last_dedup_flush = now
 
         # Mention gating for non-DM rooms
         if chat_type != "dm":
@@ -3418,11 +3685,12 @@ async def standalone_send(
 
     log = logging.getLogger(__name__)
 
+    client: Any = None
     try:
         cfg = parse_config(pconfig)
 
         if _client_factory is not None:
-            client: Any = _client_factory()
+            client = _client_factory()
         else:
             client = RocketChatClient(
                 server_url=cfg.server_url,
@@ -3465,6 +3733,16 @@ async def standalone_send(
     except Exception as exc:
         log.exception("standalone_send unexpected error")
         return {"success": False, "error": str(exc)}
+    finally:
+        # Release the HTTP session of self-created clients (injected test
+        # clients stay owned by the caller).
+        if _client_factory is None and client is not None:
+            closer = getattr(client, "close", None)
+            if callable(closer):
+                try:
+                    await closer()
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------

@@ -43,6 +43,12 @@ class FakeClient:
         self.post_message_calls.append(call)
         return {"_id": f"sent-{len(self.post_message_calls)}"}
 
+    async def room_info(self, room_id):
+        if not hasattr(self, "room_info_calls"):
+            self.room_info_calls: list[str] = []
+        self.room_info_calls.append(room_id)
+        return {"_id": room_id, "t": "d", "name": "DMs"}
+
     async def update_message(self, room_id, message_id, text):
         call = {"room_id": room_id, "message_id": message_id, "text": text}
         self.update_message_calls.append(call)
@@ -753,3 +759,81 @@ async def test_on_inbound_dedup_persists_across_adapter_restart(tmp_path):
     # Server replays the same message after restart — must be suppressed
     await adapter2._on_inbound(dm_event)
     assert len(handled2) == 0
+
+
+@pytest.mark.asyncio
+async def test_inbound_room_type_fallback_uses_room_info():
+    """Messages from rooms unknown to the transport resolve their type via
+    rooms.info, so new DMs are not mis-gated as channels; the resolved room
+    metadata also feeds get_chat_info()."""
+    cfg = RocketChatConfig(
+        server_url="https://chat.example.com",
+        auth_mode="token",
+        user_id="u1",
+        access_token="tok",
+    )
+    adapter = RocketChatAdapter(cfg)
+    client = FakeClient()
+    setattr(adapter, "_client", client)
+    adapter._connected = True
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+
+    adapter.handle_message = fake_handle  # type: ignore[method-assign]
+
+    dm_event = {
+        "_id": "dm-no-type",
+        "rid": "dm-room-new",
+        "msg": "hello",
+        "u": {"_id": "alice", "username": "alice"},
+        "t": "",
+        "mentions": [],
+        # NO _room_type: simulates a room the transport never subscribed.
+    }
+
+    await adapter._on_inbound(dm_event)
+
+    assert len(handled) == 1
+    assert handled[0].chat_type == "dm"  # not mis-gated as a channel
+    assert client.room_info_calls == ["dm-room-new"]
+    # The cached room metadata now powers get_chat_info().
+    info = await adapter.get_chat_info("dm-room-new")
+    assert info.get("t") == "d"
+    assert info.get("name") == "DMs"
+
+
+@pytest.mark.asyncio
+async def test_inbound_room_type_fallback_caches_missing_rooms():
+    """Unknown rooms are only probed once (negative caching)."""
+    cfg = RocketChatConfig(
+        server_url="https://chat.example.com",
+        auth_mode="token",
+        user_id="u1",
+        access_token="tok",
+    )
+    adapter = RocketChatAdapter(cfg)
+    client = FakeClient()
+    setattr(adapter, "_client", client)
+    adapter._connected = True
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+
+    adapter.handle_message = fake_handle  # type: ignore[method-assign]
+
+    base_event = {
+        "rid": "room-X",
+        "msg": "hi",
+        "u": {"_id": "alice", "username": "alice"},
+        "t": "",
+        "mentions": [],
+    }
+    first = dict(base_event, _id="m1")
+    second = dict(base_event, _id="m2")
+    await adapter._on_inbound(first)
+    await adapter._on_inbound(second)
+
+    assert client.room_info_calls == ["room-X"]
