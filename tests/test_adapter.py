@@ -3,12 +3,11 @@
 import pytest  # type: ignore[reportMissingImports]
 
 from adapter import (
+    PersistentSeenIdStore,
     RocketChatAdapter,
     RocketChatConfig,
     RocketChatIdentity,
-    PersistentSeenIdStore,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fake client and transport for adapter tests
@@ -111,7 +110,7 @@ async def test_adapter_connect_initializes_client_and_starts_transport():
     # Monkey-patch connect to use our fakes
 
     async def fake_connect():
-        setattr(adapter, "_client", client)
+        adapter._client = client
         await client.initialize()
         adapter._transport = transport
         transport.set_on_message(adapter._on_inbound)
@@ -153,7 +152,7 @@ async def test_adapter_send_posts_message_with_tmid():
     """send() should call client.post_message with thread info."""
     adapter = RocketChatAdapter(RocketChatConfig())
     client = FakeClient()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
 
     result = await adapter.send(
@@ -174,7 +173,7 @@ async def test_adapter_send_without_reply_to():
     """send() without reply_to should not include tmid."""
     adapter = RocketChatAdapter(RocketChatConfig())
     client = FakeClient()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
 
     result = await adapter.send(chat_id="room-1", content="hi")
@@ -188,7 +187,7 @@ async def test_adapter_send_accepts_gateway_metadata_kwarg():
     """Hermes gateway may pass send(..., metadata=...) for notices."""
     adapter = RocketChatAdapter(RocketChatConfig())
     client = FakeClient()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
 
     result = await adapter.send(
@@ -206,7 +205,7 @@ async def test_adapter_send_gateway_reply_without_thread_metadata_posts_main_roo
     """Generic Hermes reply anchors should not force Rocket.Chat thread replies."""
     adapter = RocketChatAdapter(RocketChatConfig())
     client = FakeClient()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
 
     result = await adapter.send(
@@ -225,7 +224,7 @@ async def test_adapter_send_gateway_thread_metadata_uses_thread_id():
     """Rocket.Chat threads should use explicit Hermes thread metadata."""
     adapter = RocketChatAdapter(RocketChatConfig())
     client = FakeClient()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
 
     result = await adapter.send(
@@ -244,7 +243,7 @@ async def test_adapter_send_typing_posts_placeholder_once_then_final_send_edits_
     """Hermes typing refresh should create one visible placeholder and final send should consume it."""
     adapter = RocketChatAdapter(RocketChatConfig())
     client = FakeClient()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
 
     await adapter.send_typing("room-1")
@@ -265,7 +264,7 @@ async def test_adapter_stop_typing_before_final_send_keeps_placeholder_for_edit(
     """Gateway stops typing before final delivery; final send must still edit the placeholder."""
     adapter = RocketChatAdapter(RocketChatConfig())
     client = FakeClient()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
 
     await adapter.send_typing("room-1")
@@ -309,7 +308,7 @@ async def test_adapter_dm_forwards_to_handle_message():
     )
 
     adapter = RocketChatAdapter(cfg)
-    setattr(adapter, "_client", FakeClient())
+    adapter._client = FakeClient()
     adapter._connected = True
 
     handled_events = []
@@ -349,7 +348,7 @@ async def test_adapter_inbound_text_attachment_sets_not_inlined_flag():
     )
 
     adapter = RocketChatAdapter(cfg)
-    setattr(adapter, "_client", FakeClient())
+    adapter._client = FakeClient()
     adapter._connected = True
     adapter.handle_message = lambda event: None  # type: ignore[method-assign]
 
@@ -398,7 +397,7 @@ async def test_adapter_channel_without_mention_is_ignored():
     )
 
     adapter = RocketChatAdapter(cfg)
-    setattr(adapter, "_client", FakeClient())
+    adapter._client = FakeClient()
     adapter._connected = True
 
     handled_events = []
@@ -438,7 +437,7 @@ async def test_adapter_channel_with_mention_is_forwarded():
     client = FakeClient()
     # Initialize identity so bot_username is known for mention matching
     await client.initialize()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
 
     handled_events = []
@@ -475,7 +474,7 @@ async def test_adapter_thread_reply_targeting():
 
     adapter = RocketChatAdapter(cfg)
     client = FakeClient()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
 
     handled_events = []
@@ -676,7 +675,7 @@ async def test_on_inbound_dedup_suppresses_replayed_message(tmp_path):
         dedup_store_path=str(tmp_path / "seen.json"),
     )
     adapter = RocketChatAdapter(cfg)
-    setattr(adapter, "_client", FakeClient())
+    adapter._client = FakeClient()
     adapter._connected = True
 
     handled = []
@@ -725,7 +724,7 @@ async def test_on_inbound_dedup_persists_across_adapter_restart(tmp_path):
 
     handled1 = []
     adapter1 = RocketChatAdapter(cfg)
-    setattr(adapter1, "_client", FakeClient())
+    adapter1._client = FakeClient()
     adapter1._connected = True
 
     async def fake_handle1(event):
@@ -748,7 +747,7 @@ async def test_on_inbound_dedup_persists_across_adapter_restart(tmp_path):
     # Simulate a gateway restart: brand-new adapter, same store path
     handled2 = []
     adapter2 = RocketChatAdapter(cfg)
-    setattr(adapter2, "_client", FakeClient())
+    adapter2._client = FakeClient()
     adapter2._connected = True
 
     async def fake_handle2(event):
@@ -774,7 +773,7 @@ async def test_inbound_room_type_fallback_uses_room_info():
     )
     adapter = RocketChatAdapter(cfg)
     client = FakeClient()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
     handled = []
 
@@ -815,7 +814,7 @@ async def test_inbound_room_type_fallback_caches_missing_rooms():
     )
     adapter = RocketChatAdapter(cfg)
     client = FakeClient()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
     handled = []
 
@@ -851,7 +850,7 @@ async def test_force_thread_anchors_reply_to_triggering_message():
     )
     adapter = RocketChatAdapter(cfg)
     client = FakeClient()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
 
     result = await adapter.send(chat_id="room-1", content="reply", reply_to="m-trigger")
@@ -872,7 +871,7 @@ async def test_force_thread_default_does_not_thread_channel_replies():
     )
     adapter = RocketChatAdapter(cfg)
     client = FakeClient()
-    setattr(adapter, "_client", client)
+    adapter._client = client
     adapter._connected = True
 
     await adapter.send(
@@ -880,3 +879,72 @@ async def test_force_thread_default_does_not_thread_channel_replies():
     )
 
     assert client.post_message_calls[-1]["tmid"] == ""
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1/v0.3.0: MessageEvent contract compat — the media_text_inlined kwarg
+# exists only on newer Hermes base classes (upstream 00394acfae); older
+# installs reject it and would drop every inbound message with a TypeError.
+# ---------------------------------------------------------------------------
+
+
+import dataclasses as _dc
+
+
+@_dc.dataclass
+class _OldStyleMessageEvent:
+    """Hermes MessageEvent before the media_text_inlined contract."""
+
+    text: str = ""
+    message_type: object = None
+    source: object = None
+    raw_message: object = None
+    message_id: str = ""
+    media_urls: list = _dc.field(default_factory=list)
+    media_types: list = _dc.field(default_factory=list)
+    reply_to_message_id: str = ""
+    reply_to_text: str = ""
+    reply_to_author_id: str = ""
+    reply_to_author_name: str = ""
+    reply_to_is_own_message: bool = False
+
+
+def test_build_message_event_adapts_to_messageevent_without_inlined(monkeypatch):
+    """Older MessageEvent classes reject media_text_inlined; building an
+    inbound event against one must not raise (production crash on a Hermes
+    install whose base lacks the field — server HEAD d63f996a75)."""
+    from types import SimpleNamespace
+
+    import adapter as adapter_module
+
+    adapter = RocketChatAdapter(
+        RocketChatConfig(server_url="https://chat.example.com")
+    )
+    adapter._client = FakeClient()
+    adapter._connected = True
+    monkeypatch.setattr(adapter_module, "MessageEvent", _OldStyleMessageEvent)
+
+    source = SimpleNamespace(
+        chat_id="dm-room-1", chat_type="dm", user_id="alice", user_name="alice"
+    )
+    event = adapter._build_message_event(
+        source=source,
+        raw_event={"_id": "m-1", "u": {"_id": "alice", "username": "alice"}, "msg": "hi"},
+        text="hi",
+        media_urls=[],
+        media_types=[],
+        reply_to="parent-1",
+        reply_context={
+            "text": "parent text",
+            "author_id": "alice",
+            "author_name": "alice",
+        },
+        media_text_inlined=[None],
+    )
+
+    assert event.message_id == "m-1"
+    assert event.text == "hi"
+    assert event.reply_to_message_id == "parent-1"
+    assert event.reply_to_text == "parent text"
+    assert event.reply_to_author_name == "alice"
+    assert event.chat_id == "dm-room-1"

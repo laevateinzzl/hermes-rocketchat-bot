@@ -401,7 +401,7 @@ def _parse_retry_after(value: Any) -> float | None:
 
     import re
 
-    match = re.search(r"wait\s+(\d+(?:\.\d+)?)\s+seconds?", str(value), re.I)
+    match = re.search(r"wait\s+(\d+(?:\.\d+)?)\s+seconds?", str(value), re.IGNORECASE)
     if match:
         return _parse_float_safe(match.group(1), 0.0)
     return None
@@ -921,9 +921,7 @@ class RocketChatClient:
         params: dict[str, Any] = {}
         if updated_since:
             params["updatedSince"] = updated_since
-        data = await self._request(
-            "GET", "/api/v1/subscriptions.get", params=params
-        )
+        data = await self._request("GET", "/api/v1/subscriptions.get", params=params)
         return data.get("update", data.get("subscriptions", []))
 
     async def sync_messages(
@@ -1647,8 +1645,8 @@ class PollingTransport:
 
 # Resolve the Hermes gateway so we can import from ``gateway.platforms.base``
 # the same way built-in platform plugins do (e.g. Telegram).
-import sys as _sys  # noqa: E402
-from pathlib import Path as _Path  # noqa: E402
+import sys as _sys
+from pathlib import Path as _Path
 
 _HERMES_AGENT = _Path.home() / ".hermes" / "hermes-agent"
 if str(_HERMES_AGENT) not in _sys.path:
@@ -2732,6 +2730,11 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             )
 
         try:
+            # Initialize before anything that can raise: the exception
+            # handlers read these (partial-delivery reporting) and must
+            # never hit an unbound name.
+            first_message_id = ""
+            posted_any = False
             # Chunk oversized content at paragraph/line boundaries instead of
             # hard-truncating it (splits_long_messages = True).  Every chunk
             # is posted into the same room/thread; the first chunk consumes
@@ -2753,8 +2756,6 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             placeholder_key = self._typing_placeholder_key(chat_id, metadata)
             placeholder_id = self._typing_placeholders.get(placeholder_key)
 
-            first_message_id = ""
-            posted_any = False
             for index, chunk in enumerate(chunks):
                 if (
                     index == 0
@@ -3558,55 +3559,67 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         """Build a MessageEvent for both current Hermes and local stubs."""
         ctx = reply_context or {}
         inlined = media_text_inlined or []
+        # ``media_text_inlined`` is a newer Hermes contract (upstream
+        # 00394acfae); older MessageEvent classes reject the kwarg with a
+        # TypeError that would drop every inbound message — pass it only when
+        # the bound class actually declares the field.
+        supports_inlined = "media_text_inlined" in getattr(
+            MessageEvent, "__dataclass_fields__", {}
+        )
         if isinstance(source, dict):
-            return MessageEvent(
-                chat_id=source["chat_id"],
-                chat_type=source["chat_type"],
-                user_id=source["user_id"],
-                user_name=source["user_name"],
-                text=text,
-                media_urls=media_urls,
-                media_types=media_types,
-                media_text_inlined=inlined,
-                reply_to_message_id=reply_to,
-                reply_to_text=ctx.get("text", ""),
-                reply_to_author_id=ctx.get("author_id", ""),
-                reply_to_author_name=ctx.get("author_name", ""),
-                reply_to_is_own_message=bool(
-                    ctx.get("author_id") and ctx.get("author_id") == self._bot_user_id()
+            kwargs: dict[str, Any] = {
+                "chat_id": source["chat_id"],
+                "chat_type": source["chat_type"],
+                "user_id": source["user_id"],
+                "user_name": source["user_name"],
+                "text": text,
+                "media_urls": media_urls,
+                "media_types": media_types,
+                "reply_to_message_id": reply_to,
+                "reply_to_text": ctx.get("text", ""),
+                "reply_to_author_id": ctx.get("author_id", ""),
+                "reply_to_author_name": ctx.get("author_name", ""),
+                "reply_to_is_own_message": bool(
+                    ctx.get("author_id")
+                    and ctx.get("author_id") == self._bot_user_id()
                 ),
-                raw_payload=raw_event,
-                platform="rocketchat",
-            )
+                "raw_payload": raw_event,
+                "platform": "rocketchat",
+            }
+            if supports_inlined:
+                kwargs["media_text_inlined"] = inlined
+            return MessageEvent(**kwargs)
 
         message_event_cls: Any = MessageEvent
         ctx = reply_context or {}
-        message_event = message_event_cls(
-            text=text,
-            message_type=self._message_type_for_media(media_types),
-            source=source,
-            raw_message=raw_event,
-            message_id=raw_event.get("_id", ""),
-            media_urls=media_urls,
-            media_types=media_types,
-            media_text_inlined=inlined,
-            reply_to_message_id=reply_to,
-            reply_to_text=ctx.get("text", ""),
-            reply_to_author_id=ctx.get("author_id", ""),
-            reply_to_author_name=ctx.get("author_name", ""),
-            reply_to_is_own_message=bool(
+        kwargs = {
+            "text": text,
+            "message_type": self._message_type_for_media(media_types),
+            "source": source,
+            "raw_message": raw_event,
+            "message_id": raw_event.get("_id", ""),
+            "media_urls": media_urls,
+            "media_types": media_types,
+            "reply_to_message_id": reply_to,
+            "reply_to_text": ctx.get("text", ""),
+            "reply_to_author_id": ctx.get("author_id", ""),
+            "reply_to_author_name": ctx.get("author_name", ""),
+            "reply_to_is_own_message": bool(
                 ctx.get("author_id") and ctx.get("author_id") == self._bot_user_id()
             ),
-        )
+        }
+        if supports_inlined:
+            kwargs["media_text_inlined"] = inlined
+        message_event = message_event_cls(**kwargs)
 
         # Compatibility for tests and older call sites that read flattened
         # source fields directly from MessageEvent.
-        setattr(message_event, "chat_id", getattr(source, "chat_id", ""))
-        setattr(message_event, "chat_type", getattr(source, "chat_type", ""))
-        setattr(message_event, "user_id", getattr(source, "user_id", ""))
-        setattr(message_event, "user_name", getattr(source, "user_name", ""))
-        setattr(message_event, "raw_payload", raw_event)
-        setattr(message_event, "platform", "rocketchat")
+        message_event.chat_id = getattr(source, "chat_id", "")
+        message_event.chat_type = getattr(source, "chat_type", "")
+        message_event.user_id = getattr(source, "user_id", "")
+        message_event.user_name = getattr(source, "user_name", "")
+        message_event.raw_payload = raw_event
+        message_event.platform = "rocketchat"
         return message_event
 
     def _message_type_for_media(self, media_types: list[str]) -> Any:
@@ -3853,7 +3866,7 @@ async def standalone_send(
         # Upload media files if any
         if media_files:
             for file_path in media_files:
-                upload_attachment: Any = getattr(client, "upload_attachment")
+                upload_attachment: Any = client.upload_attachment
                 uploaded = await upload_attachment(
                     room_id=room_id,
                     file_path=file_path,
