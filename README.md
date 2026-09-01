@@ -316,7 +316,7 @@ python -m ruff check .
 ## Troubleshooting
 
 | Symptom | Likely cause |
-|---|---|
+| --- | --- |
 | Plugin does not auto-enable | `ROCKETCHAT_SERVER_URL` or auth vars missing |
 | Messages not received | Token expired, wrong transport, or WebSocket blocked |
 | Bot offline after server downtime | WebSocket hung on a dead connection — ensure `ROCKETCHAT_RECEIVE_TIMEOUT` is set (default 60s) so the heartbeat detects the drop |

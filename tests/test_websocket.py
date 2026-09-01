@@ -852,9 +852,7 @@ async def test_ws_concurrent_sends_are_serialized_by_lock():
     assert not ws.sent_frames  # parked, nothing written yet
 
     # A second send must NOT start writing before the first completes.
-    second = asyncio.create_task(
-        transport._send_text(ws, json.dumps({"msg": "sub"}))
-    )
+    second = asyncio.create_task(transport._send_text(ws, json.dumps({"msg": "sub"})))
     await asyncio.sleep(0.05)
     assert ws.sent_frames == []  # second is blocked on the lock
 
