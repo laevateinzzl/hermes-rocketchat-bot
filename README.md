@@ -317,6 +317,13 @@ python -m ruff check .
 
 | Symptom | Likely cause |
 |---|---|
+| Plugin does not auto-enable | `ROCKETCHAT_SERVER_URL` or auth vars missing |
+| Messages not received | Token expired, wrong transport, or WebSocket blocked |
+| Bot offline after server downtime | WebSocket hung on a dead connection — ensure `ROCKETCHAT_RECEIVE_TIMEOUT` is set (default 60s) so the heartbeat detects the drop |
+| Bot never reconnects | Check `ROCKETCHAT_RECONNECT_MAX_ATTEMPTS` isn't set too low; 0 means unlimited |
+| Bot ignores channel messages | Mention alias not configured; use `ROCKETCHAT_MENTION_NAMES` |
+| Attachments not forwarded | `ROCKETCHAT_MEDIA_CACHE_DIR` not set or not writable |
+| "Not connected" errors | Check server URL is reachable and credentials are valid |
 
 ## Changelog
 
@@ -355,13 +362,6 @@ Three batches (A/B/C) closing every P0/P1 finding from the code audits in
   `send_path_degraded` code; `send_voice` handles `is_voice=` with
   best-effort Ogg/Opus transcode; fatal-error properties match the real
   Hermes base (local test failures fixed).
-| Plugin does not auto-enable | `ROCKETCHAT_SERVER_URL` or auth vars missing |
-| Messages not received | Token expired, wrong transport, or WebSocket blocked |
-| Bot offline after server downtime | WebSocket hung on a dead connection — ensure `ROCKETCHAT_RECEIVE_TIMEOUT` is set (default 60s) so the heartbeat detects the drop |
-| Bot never reconnects | Check `ROCKETCHAT_RECONNECT_MAX_ATTEMPTS` isn't set too low; 0 means unlimited |
-| Bot ignores channel messages | Mention alias not configured; use `ROCKETCHAT_MENTION_NAMES` |
-| Attachments not forwarded | `ROCKETCHAT_MEDIA_CACHE_DIR` not set or not writable |
-| "Not connected" errors | Check server URL is reachable and credentials are valid |
 
 ## Architecture
 
