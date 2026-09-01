@@ -144,6 +144,83 @@ async def test_send_voice_uploads_natively(media_file):
 
 
 @pytest.mark.asyncio
+async def test_send_voice_accepts_is_voice_kwarg(media_file):
+    """Hermes passes ``is_voice=`` (ccc367dce0); the adapter must not crash."""
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    result = await adapter.send_voice(
+        chat_id="room-1", audio_path=media_file, is_voice=True
+    )
+
+    assert result.success
+    assert client.uploads[0]["file_path"] == media_file
+
+
+@pytest.mark.asyncio
+async def test_send_voice_transcodes_non_opus_when_voice(media_file, monkeypatch):
+    """is_voice=True with a non-Opus file must use the Hermes transcode helper."""
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    transcoded = []
+
+    def fake_transcode(path, **kwargs):
+        transcoded.append(str(path))
+        return "/tmp/converted.ogg"
+
+    monkeypatch.setattr("adapter.transcode_to_ogg_opus", fake_transcode)
+
+    result = await adapter.send_voice(
+        chat_id="room-1", audio_path=media_file, is_voice=True
+    )
+
+    assert result.success
+    assert transcoded == [media_file]
+    assert client.uploads[0]["file_path"] == "/tmp/converted.ogg"
+
+
+@pytest.mark.asyncio
+async def test_send_voice_transcode_failure_uploads_original(media_file, monkeypatch):
+    """When transcode fails, the original file still goes out (best-effort)."""
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    monkeypatch.setattr("adapter.transcode_to_ogg_opus", lambda path, **kw: None)
+
+    result = await adapter.send_voice(
+        chat_id="room-1", audio_path=media_file, is_voice=True
+    )
+
+    assert result.success
+    assert client.uploads[0]["file_path"] == media_file
+
+
+@pytest.mark.asyncio
+async def test_send_voice_opus_skips_transcode(media_file, monkeypatch):
+    """.ogg/.opus sources are already voice-native; no transcode attempt."""
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    called = []
+
+    def fake_transcode(path, **kwargs):
+        called.append(str(path))
+        return "/tmp/converted.ogg"
+
+    monkeypatch.setattr("adapter.transcode_to_ogg_opus", fake_transcode)
+    ogg_file = media_file.replace(".png", ".ogg")
+
+    result = await adapter.send_voice(
+        chat_id="room-1", audio_path=ogg_file, is_voice=True
+    )
+
+    assert result.success
+    assert called == []
+    assert client.uploads[0]["file_path"] == ogg_file
+
+
+@pytest.mark.asyncio
 async def test_media_send_respects_thread_metadata(media_file):
     """metadata thread_id must be forwarded to the upload (tmid)."""
     client = FakeUploadClient()
@@ -166,7 +243,50 @@ async def test_media_send_returns_failure_when_not_connected(media_file):
     result = await adapter.send_image_file(chat_id="room-1", image_path=media_file)
 
     assert not result.success
-    assert result.error
+    assert result.error == "send_path_degraded"
+
+
+@pytest.mark.asyncio
+async def test_send_not_connected_reports_send_path_degraded():
+    """Transient (not-connected) send failures return the replayable code."""
+    adapter = _make_adapter(connected=False)
+
+    result = await adapter.send(chat_id="room-1", content="hello")
+
+    assert not result.success
+    assert result.error == "send_path_degraded"
+
+
+@pytest.mark.asyncio
+async def test_send_transient_client_error_reports_send_path_degraded():
+    """Network-level send errors must be replayable, not final (8e1db41041)."""
+
+    class NetworkFailingClient(FakeUploadClient):
+        async def upload_attachment(self, room_id, file_path, text="", tmid=""):
+            raise RocketChatClientError("connection reset by peer")
+
+    adapter = _make_adapter(NetworkFailingClient())
+
+    result = await adapter.send_image_file(chat_id="room-1", image_path="/tmp/x.png")
+
+    assert not result.success
+    assert result.error == "send_path_degraded"
+
+
+@pytest.mark.asyncio
+async def test_send_auth_error_stays_visible():
+    """Definitive (non-transient) failures must keep their real message."""
+
+    class AuthFailingClient(FakeUploadClient):
+        async def upload_attachment(self, room_id, file_path, text="", tmid=""):
+            raise RocketChatClientError("HTTP 401: Unauthorized")
+
+    adapter = _make_adapter(AuthFailingClient())
+
+    result = await adapter.send_image_file(chat_id="room-1", image_path="/tmp/x.png")
+
+    assert not result.success
+    assert result.error == "HTTP 401: Unauthorized"
 
 
 @pytest.mark.asyncio

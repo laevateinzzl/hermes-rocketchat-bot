@@ -69,7 +69,7 @@ async def test_connect_auth_401_marks_fatal_nonretryable(monkeypatch):
     result = await adapter.connect()
 
     assert not result
-    assert adapter.has_fatal_error()
+    assert adapter.has_fatal_error
     assert adapter.fatal_error_code == "AUTH_FAILED"
     assert not adapter.fatal_error_retryable
     assert "HTTP 401" in adapter.fatal_error_message
@@ -83,7 +83,7 @@ async def test_connect_network_error_not_fatal(monkeypatch):
     result = await adapter.connect()
 
     assert not result
-    assert not adapter.has_fatal_error()
+    assert not adapter.has_fatal_error
 
 
 @pytest.mark.asyncio
@@ -92,11 +92,11 @@ async def test_mark_auth_fatal_noop_when_base_unsupported(monkeypatch):
     adapter = _adapter(AuthFailingClient(), monkeypatch)
     # Simulate a base without fatal-error support (older Hermes).
     adapter._set_fatal_error = None  # type: ignore[assignment]
-    adapter.has_fatal_error = lambda: False  # type: ignore[method-assign]
 
     result = await adapter.connect()
 
     assert not result  # still fails closed, just no fatal metadata
+    assert not adapter.has_fatal_error
 
 
 @pytest.mark.asyncio

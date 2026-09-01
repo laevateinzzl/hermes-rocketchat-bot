@@ -966,17 +966,22 @@ async def resolve_message_media(
     message: dict,
     client: Any,
     cache_dir: str = "",
-) -> tuple[list[str], list[str]]:
-    """Download attachments into cache and return (media_urls, media_types).
+) -> tuple[list[str], list[str], list[Any | None]]:
+    """Download attachments into cache and return media metadata.
 
-    Returns two parallel lists suitable for Hermes ``MessageEvent`` fields.
+    Returns three parallel lists suitable for Hermes ``MessageEvent`` fields:
+    ``(media_urls, media_types, media_text_inlined)``.  The inlining flag is
+    ``False`` for ``text/*`` attachments (cached but NOT inlined into the
+    event ``text`` — the gateway must tell the agent to read the file itself,
+    Hermes 00394acfae) and ``None`` for everything else (no text content).
     """
     candidates = attachment_candidates_from_message(message)
     if not candidates:
-        return [], []
+        return [], [], []
 
     media_urls: list[str] = []
     media_types: list[str] = []
+    media_text_inlined: list[Any | None] = []
 
     for candidate in candidates:
         media_type = classify_attachment(candidate)
@@ -1007,8 +1012,10 @@ async def resolve_message_media(
 
         media_urls.append(local_path)
         media_types.append(media_type)
+        mime = (candidate.mime_type or "").lower()
+        media_text_inlined.append(False if mime.startswith("text/") else None)
 
-    return media_urls, media_types
+    return media_urls, media_types, media_text_inlined
 
 
 # ---------------------------------------------------------------------------
@@ -1307,6 +1314,7 @@ try:
         MessageType,
         SendResult,
         cache_image_from_url,
+        transcode_to_ogg_opus,
     )
 except ImportError:
     # Test-friendly stubs that mirror the Hermes base adapter interface
@@ -1314,6 +1322,10 @@ except ImportError:
     async def cache_image_from_url(url: str, ext: str = ".jpg") -> str:
         """Hermes image-cache downloader stub (unavailable without Hermes)."""
         raise RocketChatClientError("Image download unavailable (Hermes not installed)")
+
+    def transcode_to_ogg_opus(path: str, **kwargs: Any) -> str | None:
+        """Hermes voice-transcode helper stub (unavailable without Hermes)."""
+        return None
 
     class MessageType(str, Enum):
         TEXT = "text"
@@ -1330,6 +1342,10 @@ except ImportError:
         text: str = ""
         media_urls: list[str] = field(default_factory=list)
         media_types: list[str] = field(default_factory=list)
+        # Per-attachment text-inlining contract (Hermes 00394acfae): False
+        # means the text/* attachment was cached but NOT inlined into
+        # ``text``, so the gateway tells the agent to read the file itself.
+        media_text_inlined: list[Any | None] = field(default_factory=list)
         reply_to_message_id: str = ""
         reply_to_text: str = ""
         reply_to_author_id: str = ""
@@ -1367,6 +1383,7 @@ except ImportError:
         def is_connected(self) -> bool:
             return self._connected
 
+        @property
         def has_fatal_error(self) -> bool:
             return self._fatal_error_message is not None
 
@@ -2090,6 +2107,17 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         self._connected = True
         self._running = True
 
+        # Hermes plugin-native handler boundary (272f4e4abe): invoke factories
+        # registered by other plugins via ``ctx.register_platform_handler(
+        # "rocketchat", ...)``.  Rocket.Chat has no separate native SDK app
+        # object, so we pass ``None``; the base isolates per-factory failures.
+        wire = getattr(self, "_wire_plugin_handlers", None)
+        if callable(wire):
+            try:
+                wire(None)
+            except Exception:
+                log.exception("[rocketchat] plugin handler wiring failed")
+
         return True
 
     async def disconnect(self) -> None:
@@ -2221,12 +2249,15 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
     ) -> SendResult:
         """Send a text message (and optionally media files) to a Rocket.Chat room.
 
-        Returns a ``SendResult`` indicating success or failure.
+        Returns a ``SendResult`` indicating success or failure.  Transient
+        failures (not connected, network errors a reconnect can cure) return
+        the ``send_path_degraded`` error code so Hermes' delivery ledger
+        replays them once the gateway reconnects (Hermes 8e1db41041).
         """
         if not self._connected or self._client is None:
             return SendResult(
                 success=False,
-                error="Adapter is not connected",
+                error="send_path_degraded",
             )
 
         try:
@@ -2280,6 +2311,11 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 message_id=first_message_id,
             )
         except RocketChatClientError as exc:
+            if _is_transient_client_error(str(exc)):
+                return SendResult(
+                    success=False,
+                    error="send_path_degraded",
+                )
             return SendResult(
                 success=False,
                 error=str(exc),
@@ -2447,7 +2483,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         if not self._connected or self._client is None:
             return SendResult(
                 success=False,
-                error="Adapter is not connected",
+                error="send_path_degraded",
             )
 
         try:
@@ -2463,6 +2499,11 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 message_id=str(result.get("_id", "")),
             )
         except RocketChatClientError as exc:
+            if _is_transient_client_error(str(exc)):
+                return SendResult(
+                    success=False,
+                    error="send_path_degraded",
+                )
             return SendResult(
                 success=False,
                 error=str(exc),
@@ -2573,12 +2614,44 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         caption: str | None = None,
         reply_to: str | None = None,
         metadata: dict[str, Any] | None = None,
+        is_voice: bool = False,
         **kwargs: Any,
     ) -> SendResult:
-        """Send an audio file natively (rooms.media upload)."""
+        """Send an audio file natively (rooms.media upload).
+
+        Hermes calls this with ``is_voice=True`` when the agent explicitly
+        requested a voice bubble (ccc367dce0).  Rocket.Chat plays MP3/OGG
+        voice messages natively, but the shared Hermes transcode helper is
+        used best-effort to Ogg/Opus so mobile voice bubbles work for any
+        source format; on transcode failure the original file is uploaded.
+        """
+        src = str(audio_path)
+        if is_voice:
+            ext = os.path.splitext(src)[1].lower()
+            if ext not in (".ogg", ".opus"):
+                import logging
+
+                log = logging.getLogger(__name__)
+                try:
+                    converted = transcode_to_ogg_opus(src)
+                except Exception:
+                    converted = None
+                if converted:
+                    log.info(
+                        "[rocketchat] transcoded voice to Ogg/Opus: %s -> %s",
+                        src,
+                        converted,
+                    )
+                    src = converted
+                else:
+                    log.warning(
+                        "[rocketchat] voice transcode unavailable/failed; "
+                        "uploading original: %s",
+                        src,
+                    )
         return await self._send_media_file(
             chat_id,
-            audio_path,
+            src,
             caption=caption or "",
             reply_to=reply_to or "",
             metadata=metadata,
@@ -2680,7 +2753,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         supports it; degrades to a no-op on older Hermes versions (the
         adapter still fails closed by returning False from connect()).
         """
-        if getattr(self, "has_fatal_error", None) and self.has_fatal_error():
+        if getattr(self, "has_fatal_error", False):
             return
         setter = getattr(self, "_set_fatal_error", None)
         if callable(setter):
@@ -2779,12 +2852,15 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         # Resolve attachments
         media_urls: list[str] = []
         media_types: list[str] = []
+        media_text_inlined: list[Any | None] = []
         if self._cfg and self._cfg.media_cache_dir:
-            media_urls, media_types = await resolve_message_media(
+            media_urls, media_types, media_text_inlined = await resolve_message_media(
                 event, self._client, self._cfg.media_cache_dir
             )
         else:
-            media_urls, media_types = await resolve_message_media(event, self._client)
+            media_urls, media_types, media_text_inlined = await resolve_message_media(
+                event, self._client
+            )
 
         # Determine reply target
         reply_to = event.get("tmid", "")
@@ -2814,6 +2890,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             text=event.get("msg", ""),
             media_urls=media_urls,
             media_types=media_types,
+            media_text_inlined=media_text_inlined,
             reply_to=reply_to,
             reply_context=reply_context,
         )
@@ -2888,9 +2965,11 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         media_types: list[str],
         reply_to: str,
         reply_context: dict[str, Any] | None = None,
+        media_text_inlined: list[Any | None] | None = None,
     ) -> MessageEvent:
         """Build a MessageEvent for both current Hermes and local stubs."""
         ctx = reply_context or {}
+        inlined = media_text_inlined or []
         if isinstance(source, dict):
             return MessageEvent(
                 chat_id=source["chat_id"],
@@ -2900,6 +2979,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 text=text,
                 media_urls=media_urls,
                 media_types=media_types,
+                media_text_inlined=inlined,
                 reply_to_message_id=reply_to,
                 reply_to_text=ctx.get("text", ""),
                 reply_to_author_id=ctx.get("author_id", ""),
@@ -2921,6 +3001,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             message_id=raw_event.get("_id", ""),
             media_urls=media_urls,
             media_types=media_types,
+            media_text_inlined=inlined,
             reply_to_message_id=reply_to,
             reply_to_text=ctx.get("text", ""),
             reply_to_author_id=ctx.get("author_id", ""),
@@ -3006,6 +3087,30 @@ def _is_auth_failure_message(message: str) -> bool:
         "invalid response",
         "invalid-user",
         "invalid user",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _is_transient_client_error(message: str) -> bool:
+    """Return True when an error string looks like a transient network failure.
+
+    Deployed at outbound send time: a reconnect can cure these, so the
+    adapter returns the ``send_path_degraded`` error code Hermes' delivery
+    ledger replays after the adapter reconnects (Hermes 8e1db41041).  Auth
+    failures (handled by ``_is_auth_failure_message``) and other definitive
+    errors stay as-is so they fail visibly.
+    """
+    lowered = str(message).lower()
+    markers = (
+        "timeout",
+        "timed out",
+        "connection",
+        "not connected",
+        "connection refused",
+        "connection reset",
+        "closed",
+        "eof",
+        "read of closed",
     )
     return any(marker in lowered for marker in markers)
 
@@ -3097,6 +3202,9 @@ async def standalone_send(
     chat_id: str,
     message: str,
     media_files: list[str] | None = None,
+    *,
+    thread_id: str | None = None,
+    force_document: bool = False,
     _client_factory: Any = None,
 ) -> dict[str, Any]:
     """Send a message from a standalone context (cron job, external trigger).
@@ -3113,6 +3221,13 @@ async def standalone_send(
         Text message to send.
     media_files:
         Optional list of local file paths to upload before/beside the text.
+    thread_id:
+        Optional Rocket.Chat thread id; forwarded as ``tmid`` so deliveries
+        land inside a thread (Hermes standalone-sender contract).
+    force_document:
+        Accepted for Hermes contract parity (``tools/send_message_tool``
+        passes it).  Rocket.Chat's ``rooms.media`` flow auto-detects the
+        attachment type server-side, so no separate document path exists.
 
     Returns
     -------
@@ -3143,6 +3258,7 @@ async def standalone_send(
         # user ids / usernames resolve to a direct room (dm.create).
         room_id = await resolve_delivery_target(client, chat_id)
 
+        tmid = str(thread_id or "")
         message_id = ""
 
         # Upload media files if any
@@ -3153,12 +3269,13 @@ async def standalone_send(
                     room_id=room_id,
                     file_path=file_path,
                     text=message,
+                    tmid=tmid,
                 )
                 message_id = uploaded.get("_id", message_id)
 
         # Post text message (even when media was uploaded — may serve as caption)
         if message:
-            result = await client.post_message(room_id=room_id, text=message)
+            result = await client.post_message(room_id=room_id, text=message, tmid=tmid)
             message_id = result.get("_id", message_id)
 
         return {"success": True, "message_id": message_id}

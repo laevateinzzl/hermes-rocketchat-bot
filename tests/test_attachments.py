@@ -176,11 +176,52 @@ async def test_resolve_media_returns_local_paths():
 
     client = FakeDownloadClient()
 
-    media_urls, media_types = await resolve_message_media(message, client)
+    media_urls, media_types, media_text_inlined = await resolve_message_media(
+        message, client
+    )
 
     assert len(media_urls) == 1
     assert len(media_types) == 1
     assert media_types[0] == "image"
+    # Non-text attachments carry no inlining contract.
+    assert media_text_inlined == [None]
+
+
+@pytest.mark.asyncio
+async def test_resolve_media_text_attachment_not_inlined():
+    """text/* attachments are cached but NOT inlined into event.text.
+
+    Hermes' ``media_text_inlined`` contract (00394acfae): False tells the
+    gateway the content lives in the cached file and the agent must read
+    it itself.
+    """
+    message = {
+        "_id": "msg1",
+        "files": [
+            {
+                "_id": "f1",
+                "name": "notes.txt",
+                "type": "text/plain",
+            },
+        ],
+        "rid": "room-1",
+    }
+
+    class FakeDownloadClient:
+        server_url = "http://rc"
+        _user_id = "bot1"
+        _access_token = "tok"
+
+        async def download_attachment(self, url):
+            return b"hello world"
+
+    media_urls, media_types, media_text_inlined = await resolve_message_media(
+        message, FakeDownloadClient()
+    )
+
+    assert len(media_urls) == 1
+    assert media_types == ["document"]
+    assert media_text_inlined == [False]
 
 
 @pytest.mark.asyncio
@@ -188,7 +229,10 @@ async def test_resolve_media_no_attachments_returns_empty():
     message = {"_id": "msg1"}
     client = object()  # not used
 
-    media_urls, media_types = await resolve_message_media(message, client)
+    media_urls, media_types, media_text_inlined = await resolve_message_media(
+        message, client
+    )
 
     assert media_urls == []
     assert media_types == []
+    assert media_text_inlined == []

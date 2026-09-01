@@ -333,6 +333,52 @@ async def test_adapter_dm_forwards_to_handle_message():
 
 
 @pytest.mark.asyncio
+async def test_adapter_inbound_text_attachment_sets_not_inlined_flag():
+    """text/* attachments must reach the event flagged as NOT inlined."""
+    cfg = RocketChatConfig(
+        server_url="https://chat.example.com",
+        auth_mode="token",
+        user_id="u1",
+        access_token="tok",
+    )
+
+    adapter = RocketChatAdapter(cfg)
+    setattr(adapter, "_client", FakeClient())
+    adapter._connected = True
+    adapter.handle_message = lambda event: None  # type: ignore[method-assign]
+
+    dm_event = {
+        "_id": "dm-msg-txt",
+        "rid": "dm-room-1",
+        "msg": "see attachment",
+        "u": {"_id": "alice", "username": "alice"},
+        "t": "",
+        "mentions": [],
+        "_room_type": "d",
+        "files": [
+            {
+                "_id": "f-txt-1",
+                "name": "notes.txt",
+                "type": "text/plain",
+            },
+        ],
+    }
+
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+
+    adapter.handle_message = fake_handle  # type: ignore[method-assign]
+    await adapter._on_inbound(dm_event)
+
+    assert len(handled) == 1
+    event = handled[0]
+    assert event.media_urls == ["/file-upload/dm-room-1/f-txt-1/notes.txt"]
+    assert event.media_text_inlined == [False]
+
+
+@pytest.mark.asyncio
 async def test_adapter_channel_without_mention_is_ignored():
     """Channel messages without bot mention should not be forwarded."""
     cfg = RocketChatConfig(
@@ -550,6 +596,7 @@ def test_seen_id_store_persists_across_instances(tmp_path):
 def test_seen_id_store_ttl_expires_old_entries(tmp_path):
     """Entries older than ttl should be treated as not-seen."""
     import time
+
     store_path = str(tmp_path / "seen.json")
     store = PersistentSeenIdStore(path=store_path, ttl_seconds=1.0)
     store.mark("msg-old")
@@ -572,6 +619,7 @@ def test_seen_id_store_empty_id_not_deduped(tmp_path):
 def test_seen_id_store_atomic_write(tmp_path):
     """flush() should write a valid JSON file (no partial/corrupt files)."""
     import json
+
     store_path = str(tmp_path / "seen.json")
     store = PersistentSeenIdStore(path=store_path, ttl_seconds=3600)
     store.mark("m1")

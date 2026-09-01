@@ -140,9 +140,11 @@ async def test_password_auth_calls_login_endpoint():
         username="hermesbot",
         password="secret",
     )
+
     # override _get_session to return our fake
     async def _get_session():
         return session
+
     client._get_session = _get_session  # type: ignore[method-assign]
 
     identity = await client.initialize()
@@ -172,8 +174,10 @@ async def test_auth_failure_raises_error():
         user_id="bad-id",
         access_token="bad-token",
     )
+
     async def _get_session():
         return session
+
     client._get_session = _get_session  # type: ignore[method-assign]
 
     with pytest.raises(RocketChatClientError):
@@ -229,11 +233,13 @@ async def test_post_message_without_tmid():
     session = FakeSession(
         responses=[
             FakeResponse(
-                json_data={"success": True, "_id": "bot-user-id", "username": "hermesbot"}
+                json_data={
+                    "success": True,
+                    "_id": "bot-user-id",
+                    "username": "hermesbot",
+                }
             ),
-            FakeResponse(
-                json_data={"success": True, "message": {"_id": "msg-456"}}
-            ),
+            FakeResponse(json_data={"success": True, "message": {"_id": "msg-456"}}),
         ]
     )
     client = FakeClient(session)
@@ -343,7 +349,9 @@ async def test_download_attachment_uses_auth_headers():
     client = FakeClient(session)
     await client.initialize()
 
-    data = await client.download_attachment("https://chat.example.com/file-upload/abc/photo.jpg")
+    data = await client.download_attachment(
+        "https://chat.example.com/file-upload/abc/photo.jpg"
+    )
 
     assert data == b"fake-binary-data"
     req = session.requests[1]

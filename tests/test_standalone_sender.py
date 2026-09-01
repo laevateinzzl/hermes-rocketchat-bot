@@ -190,6 +190,76 @@ async def test_standalone_send_media_files_is_callable():
     assert "success" in result or "error" in result
 
 
+@pytest.mark.asyncio
+async def test_standalone_send_accepts_thread_and_force_document():
+    """Hermes calls the sender with thread_id=/force_document= (contract parity)."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp.write(b"fake-image-data")
+        tmp_path = tmp.name
+
+    try:
+        session = FakeUploadSession(
+            responses=[
+                # client.initialize -> /api/v1/me
+                FakeUploadResponse(
+                    status=200,
+                    json_data={"success": True, "_id": "bot1", "username": "hermesbot"},
+                ),
+                # rooms.info -> room found
+                FakeUploadResponse(
+                    status=200,
+                    json_data={"success": True, "room": {"_id": "room-thread-1"}},
+                ),
+                # rooms.media
+                FakeUploadResponse(
+                    status=200,
+                    json_data={"success": True, "file": {"_id": "f1", "name": "x.png"}},
+                ),
+                # rooms.mediaConfirm
+                FakeUploadResponse(status=200, json_data={"success": True}),
+                # chat.postMessage (file ref with caption)
+                FakeUploadResponse(
+                    status=200, json_data={"success": True, "message": {"_id": "m1"}}
+                ),
+                # chat.postMessage (text)
+                FakeUploadResponse(
+                    status=200, json_data={"success": True, "message": {"_id": "m2"}}
+                ),
+            ]
+        )
+        client = FakeUploadClient(session)
+
+        result = await standalone_send(
+            pconfig={
+                "server_url": "https://chat.example.com",
+                "auth_mode": "token",
+                "user_id": "bot1",
+                "access_token": "tok",
+            },
+            chat_id="room-thread-1",
+            message="threaded delivery",
+            media_files=[tmp_path],
+            thread_id="thread-9",
+            force_document=False,
+            _client_factory=lambda: client,
+        )
+
+        assert result["success"]
+
+        # mediaConfirm carries the thread id
+        confirm = [r for r in session.requests if "mediaConfirm" in r["url"]]
+        assert confirm
+        assert confirm[0]["json"]["tmid"] == "thread-9"
+
+        # every postMessage carries the thread id
+        posts = [r for r in session.requests if "chat.postMessage" in r["url"]]
+        assert len(posts) == 2
+        for post in posts:
+            assert post["json"]["tmid"] == "thread-9"
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # v0.2 P2.3 — user/username target resolution to DM rooms
 # ---------------------------------------------------------------------------
