@@ -532,25 +532,30 @@ async def test_download_attachment_enforces_size_cap():
 
 
 @pytest.mark.asyncio
-async def test_list_subscriptions_passes_params_and_pages():
-    """updatedSince must reach the server; >100-room bots must paginate."""
+async def test_list_subscriptions_single_call_with_since():
+    """updatedSince must reach the server; count/offset must NOT be sent.
+
+    subscriptions.get returns the full set in one response and its schema
+    rejects pagination params (HTTP 400 "must NOT have additional
+    properties"), which would spin the transports into a reconnect loop.
+    """
     session = FakeSession(
         responses=[
             FakeResponse(
-                json_data={"update": [{"rid": f"r{i}", "t": "c"} for i in range(100)]}
+                json_data={"update": [{"rid": f"r{i}", "t": "c"} for i in range(150)]}
             ),
-            FakeResponse(json_data={"update": [{"rid": "r100", "t": "c"}]}),
         ]
     )
     client = FakeClient(session)
 
     subs = await client.list_subscriptions(updated_since="2024-01-01T00:00:00.000Z")
 
-    assert len(subs) == 101
+    assert len(subs) == 150
     first = session.requests[0]
-    assert first["params"]["count"] == 100
     assert first["params"]["updatedSince"] == "2024-01-01T00:00:00.000Z"
-    assert session.requests[1]["params"]["offset"] == 100
+    assert "count" not in first["params"]
+    assert "offset" not in first["params"]
+    assert len(session.requests) == 1
 
 
 @pytest.mark.asyncio

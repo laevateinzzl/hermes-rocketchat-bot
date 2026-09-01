@@ -912,26 +912,19 @@ class RocketChatClient:
     async def list_subscriptions(self, updated_since=None) -> list[dict]:
         """List subscriptions via /api/v1/subscriptions.get.
 
-        Passes ``updatedSince`` when given (server-side delta) and pages
-        through the whole result set so bots in >50 rooms are not silently
-        truncated by the server's default page size.
+        Rocket.Chat returns the full subscription set in one response; the
+        endpoint schema accepts only ``updatedSince`` (no count/offset).
+        Sending pagination params here makes the server reject the request
+        with HTTP 400 "must NOT have additional properties", which the
+        transports treat as a connection error and loop forever on.
         """
-        all_items: list[dict] = []
-        offset = 0
-        page_size = 100
-        while True:
-            params: dict[str, Any] = {"count": page_size, "offset": offset}
-            if updated_since:
-                params["updatedSince"] = updated_since
-            data = await self._request(
-                "GET", "/api/v1/subscriptions.get", params=params
-            )
-            items = data.get("update", data.get("subscriptions", []))
-            all_items.extend(items or [])
-            if not items or len(items) < page_size:
-                break
-            offset += page_size
-        return all_items
+        params: dict[str, Any] = {}
+        if updated_since:
+            params["updatedSince"] = updated_since
+        data = await self._request(
+            "GET", "/api/v1/subscriptions.get", params=params
+        )
+        return data.get("update", data.get("subscriptions", []))
 
     async def sync_messages(
         self,
