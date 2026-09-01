@@ -796,3 +796,11 @@ async def test_websocket_refresh_does_not_resubscribe_known_rooms():
 
     sub_frames = [f for f in ws.sent_frames if '"msg": "sub"' in f]
     assert len(sub_frames) == 1
+
+
+@pytest.mark.asyncio
+async def test_ws_url_without_scheme_assumes_http():
+    """Scheme-less server configs must still produce a valid ws URL."""
+    assert _ws_url("chat.example.com:3000") == "ws://chat.example.com:3000/websocket"
+    assert _ws_url("https://chat.example.com") == "wss://chat.example.com/websocket"
+    assert _ws_url("http://chat.example.com") == "ws://chat.example.com/websocket"

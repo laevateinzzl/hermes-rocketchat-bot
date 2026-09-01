@@ -571,3 +571,62 @@ async def test_stop_typing_scoped_to_thread_with_metadata():
 
     assert "room-1\u0000thread-9" not in adapter._stream_previews
     assert "room-1\u0000thread-2" in adapter._stream_previews
+
+
+# ---------------------------------------------------------------------------
+# 0.3.0-C: UTF-16 budgeting, media-only sends
+# ---------------------------------------------------------------------------
+
+
+def test_split_long_text_budgets_utf16_units():
+    """Astral-heavy content must be chunked by UTF-16 units (emoji = 2)."""
+    from adapter import _utf16_units
+
+    adapter = RocketChatAdapter(RocketChatConfig(server_url="https://chat.example.com"))
+    emoji = "😀" * 3000  # 3000 code points == 6000 UTF-16 units
+
+    chunks = adapter._split_long_text(emoji, 4000)
+
+    assert len(chunks) >= 2
+    assert "".join(chunks) == emoji
+    for chunk in chunks:
+        assert _utf16_units(chunk) <= 4000
+
+
+def test_prefix_within_units_never_splits_surrogate_pairs():
+    from adapter import _utf16_units, _prefix_within_units
+
+    text = "ab😀cd"  # 6 units
+    prefix = _prefix_within_units(text, 5)
+    # Budget respected and never a split surrogate pair: the remainder
+    # re-combines with the prefix to the exact original.
+    assert _utf16_units(prefix) <= 5
+    assert prefix + text[len(prefix) :] == text
+
+
+@pytest.mark.asyncio
+async def test_send_delivers_media_files(media_file):
+    """send(media_files=[...]) must upload the files natively (legacy shim)."""
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    result = await adapter.send(
+        chat_id="room-1", content="with attachment", media_files=[media_file]
+    )
+
+    assert result.success
+    assert len(client.uploads) == 1
+    assert client.uploads[0]["file_path"] == media_file
+
+
+@pytest.mark.asyncio
+async def test_send_media_only_skips_empty_post(media_file):
+    """Media-only sends must not post an empty text message."""
+    client = FakeUploadClient()
+    adapter = _make_adapter(client)
+
+    result = await adapter.send(chat_id="room-1", content="", media_files=[media_file])
+
+    assert result.success
+    assert result.message_id == "media-1"
+    assert getattr(client, "post_message_calls", []) == []

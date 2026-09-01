@@ -566,3 +566,109 @@ async def test_list_subscriptions_single_page_without_since():
 
     assert len(subs) == 1
     assert "updatedSince" not in session.requests[0]["params"]
+
+
+# ---------------------------------------------------------------------------
+# 0.3.0-C: auth strictness, JSON wrapping, sync fallbacks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_verify_token_rejects_success_false_with_id():
+    """success:false must fail even when an _id is present."""
+    session = FakeSession(
+        responses=[
+            FakeResponse(json_data={"success": False, "_id": "bot-user-id"}),
+        ]
+    )
+    client = FakeClient(session)
+
+    with pytest.raises(RocketChatClientError, match="invalid response"):
+        await client.initialize()
+
+
+@pytest.mark.asyncio
+async def test_password_login_sends_no_auth_headers():
+    session = FakeSession(
+        responses=[
+            FakeResponse(
+                json_data={
+                    "status": "success",
+                    "data": {"userId": "u1", "authToken": "t1"},
+                }
+            )
+        ]
+    )
+    client = RocketChatClient(
+        server_url="https://chat.example.com",
+        username="hermesbot",
+        password="secret",
+    )
+    client._session = session
+
+    await client.initialize()
+
+    req = session.requests[0]
+    assert "X-Auth-Token" not in req["headers"]
+    assert "X-User-Id" not in req["headers"]
+
+
+@pytest.mark.asyncio
+async def test_request_wraps_invalid_json_body():
+    """A 2xx with a non-JSON body must surface as RocketChatClientError."""
+    session = FakeSession(
+        responses=[
+            FakeResponse(status=200, text_data="<html>not json</html>"),
+        ]
+    )
+    client = FakeClient(session)
+
+    with pytest.raises(RocketChatClientError, match="invalid JSON"):
+        await client._request("GET", "/api/v1/me")
+
+
+@pytest.mark.asyncio
+async def test_sync_messages_falls_back_on_http_400():
+    """Older servers answer chat.syncMessages with 400 — fall back to history."""
+    session = FakeSession(
+        responses=[
+            FakeResponse(status=400, json_data={"success": False, "error": "no"}),
+            FakeResponse(
+                status=200,
+                json_data={"messages": [{"_id": "m1", "msg": "hi"}], "removed": []},
+            ),
+        ]
+    )
+    client = FakeClient(session)
+
+    data = await client.sync_messages("room-1", last_update="ts", room_type="c")
+
+    assert data["updated"][0]["_id"] == "m1"
+    assert "channels.history" in session.requests[1]["url"]
+
+
+@pytest.mark.asyncio
+async def test_sync_messages_400_without_room_type_reraises():
+    session = FakeSession(
+        responses=[FakeResponse(status=400, json_data={"success": False})]
+    )
+    client = FakeClient(session)
+
+    with pytest.raises(RocketChatClientError):
+        await client.sync_messages("room-1", last_update="ts", room_type="")
+
+
+@pytest.mark.asyncio
+async def test_history_messages_paginates_full_pages():
+    """Fast rooms: pages beyond the first 100 are fetched when oldest is set."""
+    page_a = {"messages": [{"_id": f"m{i}"} for i in range(100)], "removed": []}
+    page_b = {"messages": [{"_id": "m-extra"}], "removed": []}
+    session = FakeSession(
+        responses=[FakeResponse(json_data=page_a), FakeResponse(json_data=page_b)]
+    )
+    client = FakeClient(session)
+
+    data = await client.history_messages("room-1", "d", oldest="ts")
+
+    assert len(data["updated"]) == 101
+    assert session.requests[1]["params"]["offset"] == 100

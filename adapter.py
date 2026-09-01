@@ -291,7 +291,9 @@ def should_handle_message(
         triggers.add(bot_username.lower())
     for alias in mention_names:
         if alias:
-            triggers.add(alias.lower())
+            # Tolerate a leading '@' in configured aliases
+            # (ROCKETCHAT_MENTION_NAMES="@helper").
+            triggers.add(alias.lower().lstrip("@"))
 
     if not triggers:
         return False
@@ -317,8 +319,23 @@ def should_handle_message(
     text_lower = text.lower()
     for trigger in triggers:
         if _has_token_mention(text_lower, trigger):
+            # Text-fallback path: honour the mass-mention flag too — when the
+            # text mentions other users next to the bot, treat it as a
+            # message for everyone, not a direct call.
+            if ignore_other_user_mentions and _has_other_mentions(text_lower, triggers):
+                return False
             return True
 
+    return False
+
+
+def _has_other_mentions(text_lower: str, triggers: set[str]) -> bool:
+    """Return True when *text_lower* @-mentions someone who is not a trigger."""
+    import re
+
+    for token in re.findall(r"@[\w.-]+", text_lower):
+        if token[1:] not in triggers:
+            return True
     return False
 
 
@@ -357,6 +374,10 @@ class RocketChatNotFoundError(RocketChatClientError):
     """Raised when a Rocket.Chat REST endpoint is unavailable."""
 
 
+# Thread reply-context cache lifetimes (seconds).
+_REPLY_CACHE_TTL = 300.0
+_REPLY_NEGATIVE_TTL = 60.0
+
 THINKING_PLACEHOLDER_TEXT = "💭 Thinking…"
 
 
@@ -384,6 +405,36 @@ def _parse_retry_after(value: Any) -> float | None:
     if match:
         return _parse_float_safe(match.group(1), 0.0)
     return None
+
+
+def _utf16_units(text: str) -> int:
+    """Count UTF-16 code units — what Rocket.Chat/JS string length uses.
+
+    Astral characters (emoji, rare CJK) count as 2 units; the plugin's
+    ``max_message_length`` budget must be measured in these units or
+    astral-heavy messages would exceed the server limit.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _prefix_within_units(text: str, max_units: int) -> str:
+    """Return the longest prefix of *text* whose UTF-16 length is <= *max_units*.
+
+    Always cuts on a code-point boundary (never splits a surrogate pair).
+    """
+    acc = 0
+    for i, ch in enumerate(text):
+        acc += 2 if ord(ch) > 0xFFFF else 1
+        if acc > max_units:
+            return text[:i]
+    return text
+
+
+def _truncate_utf16(text: str, max_units: int) -> str:
+    """Truncate *text* to at most *max_units* UTF-16 code units."""
+    if _utf16_units(text) <= max_units:
+        return text
+    return _prefix_within_units(text, max_units)
 
 
 def _absolutize_media_url(url: str, base: str) -> str:
@@ -638,18 +689,22 @@ class RocketChatClient:
         headers: dict | None = None,
         raw: bool = False,
         multipart: dict | None = None,
+        send_auth_headers: bool = True,
     ):
         """Make an HTTP request to the Rocket.Chat REST API.
 
         ``multipart`` (optional dict with ``file_path``/``filename``/
         ``content_type``) turns the request into a real file upload; it
-        takes precedence over ``json``.
+        takes precedence over ``json``.  ``send_auth_headers=False`` skips
+        the bot credentials (login flow before a token exists).
         """
         url = f"{self._server_url}{path}"
-        default_headers = {
-            "X-User-Id": self._user_id,
-            "X-Auth-Token": self._access_token,
-        }
+        default_headers: dict[str, Any] = {}
+        if send_auth_headers:
+            default_headers = {
+                "X-User-Id": self._user_id,
+                "X-Auth-Token": self._access_token,
+            }
         if headers:
             default_headers.update(headers)
 
@@ -690,7 +745,14 @@ class RocketChatClient:
                 raise RocketChatNotFoundError(message)
             raise RocketChatClientError(message)
 
-        return await _maybe_await(resp.json())
+        try:
+            return await _maybe_await(resp.json())
+        except RocketChatClientError:
+            raise
+        except Exception as exc:
+            raise RocketChatClientError(
+                f"{method} {path} returned invalid JSON: {exc}"
+            ) from exc
 
     # -- authentication ------------------------------------------------------
 
@@ -708,7 +770,7 @@ class RocketChatClient:
         except Exception as exc:
             raise RocketChatClientError(f"Token verification failed: {exc}") from exc
 
-        if not data.get("success", False) and not data.get("_id"):
+        if not data.get("success") or not data.get("_id"):
             raise RocketChatClientError("Token verification failed: invalid response")
 
         identity = RocketChatIdentity(
@@ -727,7 +789,7 @@ class RocketChatClient:
                 "POST",
                 "/api/v1/login",
                 json={"user": self._username, "password": self._password},
-                headers={},  # no auth headers yet
+                send_auth_headers=False,  # no credentials exist before login
             )
         except Exception as exc:
             raise RocketChatClientError(f"Password login failed: {exc}") from exc
@@ -885,7 +947,21 @@ class RocketChatClient:
             return await self._request(
                 "POST", "/api/v1/chat.syncMessages", json=payload
             )
-        except RocketChatNotFoundError:
+        except RocketChatNotFoundError as exc:
+            if "HTTP 404" not in str(exc):
+                raise
+            if not room_type:
+                raise
+            return await self.history_messages(
+                room_id=room_id,
+                room_type=room_type,
+                oldest=last_update,
+            )
+        except RocketChatClientError as exc:
+            # Older servers reject chat.syncMessages with a 400 instead of a
+            # 404 — same fallback applies.
+            if "HTTP 400" not in str(exc):
+                raise
             if not room_type:
                 raise
             return await self.history_messages(
@@ -916,12 +992,25 @@ class RocketChatClient:
             params["oldest"] = oldest
             params["inclusive"] = "false"
 
-        data = await self._request("GET", endpoint, params=params)
-        messages = data.get("messages", []) if isinstance(data, dict) else []
-        return {
-            "updated": list(reversed(messages)),
-            "removed": data.get("removed", []) if isinstance(data, dict) else [],
-        }
+        # Page newest-first (the fallback path on servers without
+        # chat.syncMessages): up to 5 pages so fast rooms do not drop
+        # messages between polls.  Offset pages walk backwards into older
+        # history; delivering "updated" oldest-first keeps the dedup
+        # checkpoints monotonic.
+        messages: list[Any] = []
+        removed: list[Any] = []
+        for _page in range(5):
+            data = await self._request("GET", endpoint, params=params)
+            if not isinstance(data, dict):
+                break
+            page_messages = data.get("messages", []) or []
+            messages.extend(page_messages)
+            removed.extend(data.get("removed", []) or [])
+            if len(page_messages) < 100 or not oldest:
+                break
+            params["offset"] = int(params.get("offset", 0) or 0) + 100
+
+        return {"updated": list(reversed(messages)), "removed": removed}
 
     # -- download ------------------------------------------------------------
 
@@ -1478,7 +1567,7 @@ class PollingTransport:
                         await self._client.initialize()
                         log.info("Re-authentication succeeded")
                     except Exception as reauth_exc:
-                        log.exception("Re-authentication failed: %s", reauth_exc)
+                        log.exception("Re-authentication failed")
                         callback = self._on_auth_failure
                         if callable(callback):
                             try:
@@ -1716,8 +1805,10 @@ def _ws_url(server_url: str) -> str:
     url = server_url.rstrip("/")
     if url.startswith("https://"):
         return url.replace("https://", "wss://", 1) + "/websocket"
-    else:
-        return url.replace("http://", "ws" + "://", 1) + "/websocket"
+    if url.startswith("http://"):
+        return url.replace("http://", "ws://", 1) + "/websocket"
+    # Scheme-less config (e.g. "chat.example.com:3000"): assume http.
+    return "ws://" + url + "/websocket"
 
 
 class WebSocketTransport:
@@ -1968,7 +2059,7 @@ class WebSocketTransport:
                 # No traffic for a while — probe the connection with a ping
                 await _ws_send_text(ws, json.dumps({"msg": "ping"}))
                 try:
-                    await asyncio.wait_for(
+                    frame = await asyncio.wait_for(
                         _ws_recv_text(ws), timeout=self._ping_timeout
                     )
                 except asyncio.TimeoutError as _ping_timeout:
@@ -1976,6 +2067,9 @@ class WebSocketTransport:
                         f"WebSocket unresponsive: no frame within "
                         f"{self._receive_timeout}s + ping {self._ping_timeout}s"
                     )
+                # A real frame may have landed during the probe — dispatch it
+                # instead of discarding it.
+                await self._handle_frame(frame, ws)
                 continue
             await self._handle_frame(frame, ws)
 
@@ -2291,7 +2385,12 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         self._last_status_text: BoundedDict[str, str] = BoundedDict(maxsize=500)
         # Thread parent-message cache for reply-context backfill (message id →
         # normalized context dict), bounded so long-running gateways stay flat.
-        self._reply_cache: BoundedDict[str, dict[str, Any]] = BoundedDict(maxsize=200)
+        # Thread parent-message cache for reply-context backfill (message id →
+        # (timestamp, context-or-None)), bounded so long-running gateways
+        # stay flat; None marks a negative (deleted parent) lookup.
+        self._reply_cache: BoundedDict[str, tuple[float, dict[str, Any] | None]] = (
+            BoundedDict(maxsize=200)
+        )
         self._cfg: RocketChatConfig | None = None
         self._seen_id_store: PersistentSeenIdStore | None = None
         # Monotonic timestamp of the last seen-id disk flush (throttled).
@@ -2648,10 +2747,13 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             max_len = self._cfg.max_message_length if self._cfg else 4000
             # 0 / negative means "no limit" (Hermes registry semantics) and
             # must never reach the chunker (which would loop at max_len=0).
-            if max_len > 0 and len(text) > max_len:
+            if max_len > 0 and _utf16_units(text) > max_len:
                 chunks = self._split_long_text(text, max_len)
             else:
                 chunks = [text]
+            if not text:
+                # Media-only send: never post an empty message.
+                chunks = []
 
             tmid = self._resolve_tmid(chat_id, reply_to, metadata)
 
@@ -2702,6 +2804,30 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                     if not first_message_id:
                         first_message_id = result.get("_id", "")
                 posted_any = True
+
+            # Legacy media_files shim: deliver file attachments natively too
+            # (Hermes' MEDIA: contract uses the dedicated send_* methods, but
+            # direct callers may pass media_files to send()).
+            for media_path in media_files or []:
+                media_result = await self._send_media_file(
+                    chat_id,
+                    media_path,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                if media_result.success:
+                    if not first_message_id:
+                        first_message_id = media_result.message_id
+                    continue
+                if first_message_id:
+                    # Text already delivered; media failed: report a final
+                    # partial failure (never the replayable code).
+                    return SendResult(
+                        success=False,
+                        error=media_result.error,
+                        message_id=first_message_id,
+                    )
+                return media_result
 
             return SendResult(
                 success=True,
@@ -2768,8 +2894,10 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         try:
             text = content
             max_len = self._cfg.max_message_length if self._cfg else 4000
-            if max_len > 0 and len(text) > max_len:
-                text = text[:max_len]
+            if max_len > 0:
+                # Stream edits use the same UTF-16 budget as send() so the
+                # final content is never server-truncated mid-word.
+                text = _truncate_utf16(text, max_len)
 
             result = await self._client.update_message(
                 room_id=chat_id,
@@ -2814,23 +2942,30 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         metadata_thread_id = self._metadata_thread_id(metadata)
         if metadata_thread_id:
             return metadata_thread_id
+        # ROCKETCHAT_FORCE_THREAD: always anchor replies into the triggering
+        # message's thread.
+        if self._cfg is not None and self._cfg.force_thread:
+            return reply_to or ""
         if metadata is None:
             return reply_to or ""
         return ""
 
     @staticmethod
     def _split_long_text(text: str, max_len: int) -> list[str]:
-        """Split *text* into chunks of at most *max_len* characters.
+        """Split *text* into chunks whose UTF-16 length fits *max_len*.
 
-        Splits at paragraph (``\n\n``) boundaries first, then line (``\n``)
-        boundaries, then hard-splits any remaining single line (preferring a
-        word boundary near the limit).  The concatenation ``"".join(chunks)``
-        always equals the input exactly — nothing is truncated or inserted.
+        Rocket.Chat limits message size in UTF-16 code units (JS string
+        length — astral characters like emoji count as 2), so the budget is
+        measured with ``_utf16_units``, never ``len()``.  Splits at paragraph
+        (``\\n\\n``) boundaries first, then line (``\\n``) boundaries, then
+        hard-splits any remaining single line (preferring a word boundary
+        near the limit).  The concatenation ``"".join(chunks)`` always equals
+        the input exactly — nothing is truncated or inserted.
         """
         if max_len <= 0:
             return [text]
         max_len = max(1, int(max_len))
-        if len(text) <= max_len:
+        if _utf16_units(text) <= max_len:
             return [text]
 
         chunks: list[str] = []
@@ -2846,12 +2981,12 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
 
         for pi, para in enumerate(paragraphs):
             sep = "\n\n" if pi < n_paras - 1 else ""
-            if len(current + para + sep) <= max_len:
+            if _utf16_units(current + para + sep) <= max_len:
                 current += para + sep
                 continue
             _flush()
             # Paragraph (with separator) alone may still fit after flushing.
-            if len(para + sep) <= max_len:
+            if _utf16_units(para + sep) <= max_len:
                 current = para + sep
                 continue
             # Paragraph too long: split by lines.
@@ -2859,22 +2994,26 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             n_lines = len(lines)
             for li, line in enumerate(lines):
                 lsep = "\n" if li < n_lines - 1 else sep
-                if len(current + line + lsep) <= max_len:
+                if _utf16_units(current + line + lsep) <= max_len:
                     current += line + lsep
                     continue
                 _flush()
-                if len(line + lsep) <= max_len:
+                if _utf16_units(line + lsep) <= max_len:
                     current = line + lsep
                     continue
-                # Single line too long: hard-split at a word boundary.
+                # Single line too long: hard-split at a word boundary inside
+                # the UTF-16 budget.
                 remaining = line + lsep
-                while len(remaining) > max_len:
-                    cut = remaining[:max_len]
-                    space = cut.rfind(" ")
+                while _utf16_units(remaining) > max_len:
+                    piece = _prefix_within_units(remaining, max_len)
+                    space = piece.rfind(" ")
                     if space > max_len // 2:
-                        piece, remaining = cut[:space], remaining[space:]
-                    else:
-                        piece, remaining = cut, remaining[max_len:]
+                        piece = piece[:space]
+                    remaining = remaining[len(piece) :]
+                    if not piece:
+                        # Degenerate guard: never loop on a zero-width piece.
+                        piece = remaining[:1]
+                        remaining = remaining[1:]
                     chunks.append(piece)
                 current = remaining
 
@@ -3383,15 +3522,25 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         Returns a normalized dict with ``text``, ``author_id`` and
         ``author_name`` keys, or ``{}`` when the parent is unavailable
         (deleted, permission denied) — inbound delivery never blocks on it.
+
+        Caching: positive entries live ``_REPLY_CACHE_TTL``; failed lookups
+        are cached as negatives for ``_REPLY_NEGATIVE_TTL`` so deleted
+        parents do not trigger a ``getMessage`` 404 on every reply.
         """
+        import time as _time
+
         if not message_id or self._client is None:
             return {}
         cached = self._reply_cache.get(message_id)
         if cached is not None:
-            return cached
+            ts, value = cached
+            ttl = _REPLY_NEGATIVE_TTL if value is None else _REPLY_CACHE_TTL
+            if _time.time() - ts < ttl:
+                return {} if value is None else value
         try:
             parent = await self._client.get_message(message_id)
         except (RocketChatClientError, AttributeError):
+            self._reply_cache[message_id] = (_time.time(), None)
             return {}
         author = parent.get("u") or {}
         context = {
@@ -3399,7 +3548,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             "author_id": str(author.get("_id") or ""),
             "author_name": str(author.get("username") or ""),
         }
-        self._reply_cache[message_id] = context
+        self._reply_cache[message_id] = (_time.time(), context)
         return context
 
     def _build_message_event(
@@ -3792,7 +3941,7 @@ def register(ctx: Any) -> None:
         allowed_users_env="ROCKETCHAT_ALLOWED_USERS",
         allow_all_env="ROCKETCHAT_ALLOW_ALL_USERS",
         cron_deliver_env_var="ROCKETCHAT_HOME_CHANNEL",
-        max_message_length=4000,
+        max_message_length=parse_config().max_message_length,
         platform_hint=(
             "You are chatting via Rocket.Chat. DMs are direct conversations; "
             "channel replies should be concise and thread-aware. Markdown is supported."

@@ -837,3 +837,46 @@ async def test_inbound_room_type_fallback_caches_missing_rooms():
     await adapter._on_inbound(second)
 
     assert client.room_info_calls == ["room-X"]
+
+
+@pytest.mark.asyncio
+async def test_force_thread_anchors_reply_to_triggering_message():
+    """ROCKETCHAT_FORCE_THREAD=true must anchor replies in the trigger thread."""
+    cfg = RocketChatConfig(
+        server_url="https://chat.example.com",
+        auth_mode="token",
+        user_id="u1",
+        access_token="tok",
+        force_thread=True,
+    )
+    adapter = RocketChatAdapter(cfg)
+    client = FakeClient()
+    setattr(adapter, "_client", client)
+    adapter._connected = True
+
+    result = await adapter.send(chat_id="room-1", content="reply", reply_to="m-trigger")
+
+    assert result.success
+    assert client.post_message_calls[-1]["tmid"] == "m-trigger"
+
+
+@pytest.mark.asyncio
+async def test_force_thread_default_does_not_thread_channel_replies():
+    """Without force_thread, plain channel replies are NOT thread-anchored."""
+    cfg = RocketChatConfig(
+        server_url="https://chat.example.com",
+        auth_mode="token",
+        user_id="u1",
+        access_token="tok",
+        force_thread=False,
+    )
+    adapter = RocketChatAdapter(cfg)
+    client = FakeClient()
+    setattr(adapter, "_client", client)
+    adapter._connected = True
+
+    await adapter.send(
+        chat_id="room-1", content="reply", reply_to="m-trigger", metadata={}
+    )
+
+    assert client.post_message_calls[-1]["tmid"] == ""

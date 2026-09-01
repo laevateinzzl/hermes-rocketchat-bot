@@ -251,8 +251,11 @@ ROCKETCHAT_POLL_INTERVAL_SECONDS=3    # polling transport interval
 - **Long replies are split, not truncated** — `splits_long_messages` is
   enabled and `send()` chunks oversized content at paragraph/line boundaries
   into multiple messages in the same room/thread (each ≤
-  `ROCKETCHAT_MAX_MESSAGE_LENGTH`). The delivery router therefore delivers
-  full output without gateway-level truncation.
+  `ROCKETCHAT_MAX_MESSAGE_LENGTH`). Chunk budgets are measured in UTF-16
+  code units — the unit Rocket.Chat itself validates — so astral-heavy text
+  (emoji, rare CJK, each worth 2 units) never exceeds the server limit.
+  The delivery router therefore delivers full output without
+  gateway-level truncation.
 - **Code blocks** — `supports_code_blocks` is enabled; Rocket.Chat renders
   markdown fenced code blocks natively.
 

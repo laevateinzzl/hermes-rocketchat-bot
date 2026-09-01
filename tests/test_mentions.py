@@ -212,3 +212,48 @@ async def test_on_inbound_always_respond_room_bypasses_mention_gate():
     await adapter._on_inbound(event)
 
     assert len(handled) == 1
+
+
+def test_alias_with_leading_at_matches():
+    """ROCKETCHAT_MENTION_NAMES='@helper' must trigger like 'helper'."""
+    from adapter import should_handle_message
+
+    assert should_handle_message(
+        room_type="c",
+        text="@helper look at this",
+        mentions=[],
+        bot_user_id="bot1",
+        bot_username="hermesbot",
+        mention_names=["@helper"],
+    )
+
+
+def test_ignore_other_mentions_text_fallback_mass_mention():
+    """A text-only mass mention (no metadata) honors ignore_other_user_mentions."""
+    from adapter import should_handle_message
+
+    # Bot + someone else in the text: mass mention -> quiet.
+    assert not should_handle_message(
+        room_type="c",
+        text="@hermesbot @alice what do you think",
+        mentions=[],
+        bot_user_id="bot1",
+        bot_username="hermesbot",
+        mention_names=["hermes"],
+        ignore_other_user_mentions=True,
+    )
+
+
+def test_ignore_other_mentions_text_fallback_direct_mention():
+    """A direct @bot without others in the text still answers."""
+    from adapter import should_handle_message
+
+    assert should_handle_message(
+        room_type="c",
+        text="only @hermesbot please",
+        mentions=[],
+        bot_user_id="bot1",
+        bot_username="hermesbot",
+        mention_names=["hermes"],
+        ignore_other_user_mentions=True,
+    )

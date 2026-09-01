@@ -6,6 +6,7 @@ from pathlib import Path
 
 from adapter import (
     RocketChatClient,
+    RocketChatClientError,
     resolve_delivery_target,
     standalone_send,
 )
@@ -156,28 +157,30 @@ async def test_upload_attachment_calls_rooms_media_and_confirm():
 
 @pytest.mark.asyncio
 async def test_standalone_send_text_only():
-    """standalone_send should be callable and return a SendResult-like dict."""
-    result = await standalone_send(
-        pconfig={
-            "server_url": "https://chat.example.com",
-            "auth_mode": "token",
-            "user_id": "bot1",
-            "access_token": "tok",
-        },
-        chat_id="room-1",
-        message="test message",
-    )
-
-    # Without a real client, we expect either an error or a timeout
-    # In test environment with no network, it should return error gracefully
-    assert isinstance(result, dict)
-    # The result dict should have expected keys
-    assert "success" in result or "error" in result
+    """standalone_send must fail cleanly without network access."""
+    await _assert_clean_failure(message="test message")
 
 
 @pytest.mark.asyncio
 async def test_standalone_send_media_files_is_callable():
-    """standalone_send should accept media_files parameter."""
+    """standalone_send must accept media_files (contract parity)."""
+    await _assert_clean_failure(message="here is an image", media_files=[])
+
+
+async def _assert_clean_failure(message: str, media_files=None):
+    """Run standalone_send with a client that cannot authenticate and assert
+    the failure contract — no real network, no unclosed sessions."""
+
+    class FailingAuthClient(RocketChatClient):
+        def __init__(self):
+            pass
+
+        async def initialize(self):
+            raise RocketChatClientError("HTTP 401: Unauthorized")
+
+        async def _get_session(self):
+            raise AssertionError("network access attempted")
+
     result = await standalone_send(
         pconfig={
             "server_url": "https://chat.example.com",
@@ -186,12 +189,14 @@ async def test_standalone_send_media_files_is_callable():
             "access_token": "tok",
         },
         chat_id="room-1",
-        message="here is an image",
-        media_files=[],
+        message=message,
+        media_files=media_files,
+        _client_factory=FailingAuthClient,
     )
 
     assert isinstance(result, dict)
-    assert "success" in result or "error" in result
+    assert result.get("success") is False
+    assert "401" in result.get("error", "")
 
 
 @pytest.mark.asyncio
