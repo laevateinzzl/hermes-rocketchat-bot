@@ -317,6 +317,44 @@ python -m ruff check .
 
 | Symptom | Likely cause |
 |---|---|
+
+## Changelog
+
+### 0.3.0 (2026-09-01) — audit-driven hardening
+
+Three batches (A/B/C) closing every P0/P1 finding from the code audits in
+[`docs/audits/`](docs/audits/):
+
+- **Media pipeline (A)** — `upload_attachment` now sends real file bytes via
+  multipart form data (aiohttp `FormData` / httpx `files=`); inbound
+  server-hosted attachments get absolute URLs before download; inbound
+  downloads are hardened (credentials only same-origin, cross-origin fetches
+  are credential-free/https/private-IP-blocked, redirects re-checked,
+  timeout + size cap).
+- **Transports (B)** — one reused HTTP session with explicit timeouts; DDP
+  login errors / `failed` frames / stuck handshakes are surfaced; WebSocket
+  re-subscribes rooms created after connect with a `rooms.info` type
+  fallback (also powers `get_chat_info()`); `subscriptions.get` delta +
+  pagination; polling re-authenticates on 401; dedup flushes throttled;
+  bounded transport memory.
+- **Delivery semantics (B/C)** — chunk budgets measured in UTF-16 units
+  (Rocket.Chat's real limit); mid-chunk failures never replay the delivered
+  prefix; outbound 429s are replayable; placeholder lifecycle hardened
+  (no ghost bubbles, thread-scoped `stop_typing`); `force_thread` actually
+  anchors replies; legacy `send(media_files=)` really uploads; reply-context
+  cache gains negative caching + TTL.
+- **Config & tests** — `plugin.yaml` registers all functional env keys
+  (including `ROCKETCHAT_SUBSCRIPTION_REFRESH_SECONDS`); auth checks
+  tightened; tests no longer touch the network (239 tests, no egress).
+
+### 0.2.1 (2026-08-06) — Hermes upstream contract alignment
+
+- `media_text_inlined` flags for text attachments; `_wire_plugin_handlers`
+  called from `connect()`; `standalone_send` accepts `thread_id` /
+  `force_document`; transient send failures return the replayable
+  `send_path_degraded` code; `send_voice` handles `is_voice=` with
+  best-effort Ogg/Opus transcode; fatal-error properties match the real
+  Hermes base (local test failures fixed).
 | Plugin does not auto-enable | `ROCKETCHAT_SERVER_URL` or auth vars missing |
 | Messages not received | Token expired, wrong transport, or WebSocket blocked |
 | Bot offline after server downtime | WebSocket hung on a dead connection — ensure `ROCKETCHAT_RECEIVE_TIMEOUT` is set (default 60s) so the heartbeat detects the drop |
