@@ -11,7 +11,6 @@ from adapter import (
     RocketChatRateLimitError,
 )
 
-
 # ---------------------------------------------------------------------------
 # Checkpoint store tests
 # ---------------------------------------------------------------------------
@@ -393,3 +392,39 @@ async def test_poll_reports_fatal_when_reauth_fails():
         pass
 
     assert len(fatal) >= 1
+
+
+# ---------------------------------------------------------------------------
+# stop() session release (audit P1-1 review finding)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_polling_stop_releases_shared_client_session():
+    """Audit P1-1: stopping the polling transport must close the client's REST session."""
+
+    class _ClosingClient(FakePollingClient):
+        close_called: bool = False
+
+        async def close(self):
+            self.close_called = True
+
+    client = _ClosingClient()
+    import asyncio
+
+    transport = PollingTransport(client=client, poll_interval=0.01)
+    await transport.start()
+    await asyncio.sleep(0.05)
+    await transport.stop()
+    assert client.close_called
+
+
+@pytest.mark.asyncio
+async def test_polling_stop_tolerates_client_without_close():
+    """stop() must not crash for injected fakes lacking close()."""
+    import asyncio
+
+    transport = PollingTransport(client=FakePollingClient(), poll_interval=0.01)
+    await transport.start()
+    await asyncio.sleep(0.05)
+    await transport.stop()  # no exception

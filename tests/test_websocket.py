@@ -5,8 +5,7 @@ import json
 
 import pytest  # type: ignore[reportMissingImports]
 
-from adapter import WebSocketTransport, _ws_url, RocketChatClientError
-
+from adapter import RocketChatClientError, WebSocketTransport, _ws_url
 
 # ---------------------------------------------------------------------------
 # Fake WebSocket for testing
@@ -581,7 +580,6 @@ async def test_auth_error_triggers_reauthentication():
     class ReauthClient(FakeWSClient):
         async def initialize(self):
             reauth_calls["n"] += 1
-            return None
 
     # A WS that fails the login step with an auth-style error
     ws = FakeWebSocket(
@@ -804,3 +802,152 @@ async def test_ws_url_without_scheme_assumes_http():
     assert _ws_url("chat.example.com:3000") == "ws://chat.example.com:3000/websocket"
     assert _ws_url("https://chat.example.com") == "wss://chat.example.com/websocket"
     assert _ws_url("http://chat.example.com") == "ws://chat.example.com/websocket"
+
+
+# ---------------------------------------------------------------------------
+# Concurrent-write serialization and stop() session release (review findings)
+# ---------------------------------------------------------------------------
+
+
+class _BlockingWebSocket:
+    """WebSocket whose send() blocks until a gate event is set.
+
+    Lets a test prove that two concurrent _send_text calls cannot interleave:
+    the first coroutine holds the lock while blocked inside send(), and the
+    second must wait.
+    """
+
+    def __init__(self):
+        self.gate = asyncio.Event()
+        self.sent_frames: list[str] = []
+
+    async def send(self, data: str):
+        # Simulate the multi-await window of a real aiohttp send: park here
+        # until the test releases the gate.
+        await self.gate.wait()
+        self.sent_frames.append(data)
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_ws_concurrent_sends_are_serialized_by_lock():
+    """Two coroutines sending on the same socket must not interleave writes.
+
+    Regression for the review finding that _read_loop (heartbeat pings) and
+    _subscription_refresh_loop (room subscriptions) both call _ws_send_text on
+    the same aiohttp socket without a lock, risking garbled frames.
+    """
+    ws = _BlockingWebSocket()
+    transport = WebSocketTransport(
+        client=FakeWSClient(),
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=_factory(ws),
+    )
+
+    # Fire a first send; it parks inside ws.send() holding the lock.
+    first = asyncio.create_task(transport._send_text(ws, json.dumps({"msg": "ping"})))
+    await asyncio.sleep(0.05)
+    assert not ws.sent_frames  # parked, nothing written yet
+
+    # A second send must NOT start writing before the first completes.
+    second = asyncio.create_task(
+        transport._send_text(ws, json.dumps({"msg": "sub"}))
+    )
+    await asyncio.sleep(0.05)
+    assert ws.sent_frames == []  # second is blocked on the lock
+
+    ws.gate.set()
+    await asyncio.gather(first, second)
+
+    # Both frames arrived whole, in issue order.
+    assert len(ws.sent_frames) == 2
+
+
+@pytest.mark.asyncio
+async def test_ws_stop_releases_shared_client_session():
+    """Audit P1-1: stopping the transport must close the client's REST session."""
+
+    class _ClosingClient(FakeWSClient):
+        close_called: bool = False
+
+        async def close(self):
+            self.close_called = True
+
+    client = _ClosingClient()
+    transport = WebSocketTransport(
+        client=client,
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=_factory(FakeWebSocket()),
+    )
+    await transport.stop()
+    assert client.close_called
+
+
+@pytest.mark.asyncio
+async def test_ws_stop_tolerates_client_without_close():
+    """stop() must not crash for injected fakes lacking close()."""
+    transport = WebSocketTransport(
+        client=FakeWSClient(),
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=_factory(FakeWebSocket()),
+    )
+    await transport.stop()  # no exception
+
+
+@pytest.mark.asyncio
+async def test_ws_400_from_subscriptions_get_gives_up_not_loops():
+    """A persistent HTTP 400 from subscriptions.get must not loop forever.
+
+    Regression for the 2026-09-01 production incident: v0.3.0-B sent
+    count/offset to subscriptions.get whose schema rejects them, so every
+    connect bootstrapped into an endless reconnect loop (bot online but
+    never answering).  With a bounded attempt cap the transport must give
+    up and emit 'failed' instead of reconnecting forever.
+    """
+
+    class _FourHundredSubClient(FakeWSClient):
+        def __init__(self, subscriptions=None):
+            super().__init__(subscriptions=subscriptions)
+            self.calls = 0
+
+        async def list_subscriptions(self):
+            self.calls += 1
+            raise RocketChatClientError(
+                "GET /api/v1/subscriptions.get failed: HTTP 400: "
+                '{"success":false,"error":"must NOT have additional properties"}'
+            )
+
+    statuses = []
+
+    def on_status(status, detail):
+        statuses.append(status)
+
+    client = _FourHundredSubClient(subscriptions=[])
+    calls = {"n": 0}
+
+    async def fresh_factory():
+        # Every attempt gets a fresh websocket so each one reaches the
+        # bootstrap step (which is where the 400 is raised).
+        calls["n"] += 1
+        return FakeWebSocket([_connected_frame(), _login_result()])
+
+    transport = WebSocketTransport(
+        client=client,
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=fresh_factory,
+        reconnect_initial_delay=0.01,
+        reconnect_max_delay=0.01,
+        reconnect_max_attempts=2,
+        reconnect_jitter=0.0,
+    )
+    transport.set_on_status(on_status)
+
+    await transport.start()
+    await asyncio.sleep(0.4)
+
+    assert not transport._running
+    assert "failed" in statuses
+    # The 400 was actually exercised on the subscription path.
+    assert client.calls >= 1

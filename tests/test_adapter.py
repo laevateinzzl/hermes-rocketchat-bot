@@ -917,9 +917,7 @@ def test_build_message_event_adapts_to_messageevent_without_inlined(monkeypatch)
 
     import adapter as adapter_module
 
-    adapter = RocketChatAdapter(
-        RocketChatConfig(server_url="https://chat.example.com")
-    )
+    adapter = RocketChatAdapter(RocketChatConfig(server_url="https://chat.example.com"))
     adapter._client = FakeClient()
     adapter._connected = True
     monkeypatch.setattr(adapter_module, "MessageEvent", _OldStyleMessageEvent)
@@ -929,7 +927,11 @@ def test_build_message_event_adapts_to_messageevent_without_inlined(monkeypatch)
     )
     event = adapter._build_message_event(
         source=source,
-        raw_event={"_id": "m-1", "u": {"_id": "alice", "username": "alice"}, "msg": "hi"},
+        raw_event={
+            "_id": "m-1",
+            "u": {"_id": "alice", "username": "alice"},
+            "msg": "hi",
+        },
         text="hi",
         media_urls=[],
         media_types=[],

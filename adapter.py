@@ -1507,13 +1507,24 @@ class PollingTransport:
         self._task = asyncio.create_task(self._poll_loop())
 
     async def stop(self):
-        """Stop the polling loop."""
+        """Stop the polling loop and release the shared REST session.
+
+        Audit P1-1: mirrors WebSocketTransport.stop(); the client session
+        must not outlive a stopped transport.  ``client.close()`` is
+        idempotent and the session is recreated lazily on the next poll.
+        """
         self._running = False
         if self._task:
             self._task.cancel()
             try:
                 await self._task
             except (Exception, asyncio.CancelledError):
+                pass
+        closer = getattr(self._client, "close", None)
+        if callable(closer):
+            try:
+                await closer()
+            except Exception:
                 pass
 
     def _sleep_after_error(self, error: Exception) -> float:
@@ -1896,6 +1907,11 @@ class WebSocketTransport:
         self._reconnect_attempts = 0
         # aiohttp session owned by the default factory, closed on reconnect/stop
         self._http_session: Any = None
+        # Serializes every DDP frame write: the heartbeat/_read_loop and the
+        # subscription-refresh loop run concurrently on the same socket, and
+        # aiohttp sends span multiple awaits, so interleaved writes could
+        # corrupt frames.  One per transport, never per-connection.
+        self._ws_send_lock = asyncio.Lock()
 
     # -- public API -----------------------------------------------------------
 
@@ -1929,6 +1945,16 @@ class WebSocketTransport:
             except Exception as _exc:
                 pass
         await self._close_http_session()
+        # Audit P1-1: the shared REST session must be released too, or a
+        # stopped transport leaks the client's HTTP connection pool.  The
+        # adapter recreates the client on the next connect() and the client's
+        # own close() is idempotent, so this is safe to call unconditionally.
+        closer = getattr(self._client, "close", None)
+        if callable(closer):
+            try:
+                await closer()
+            except Exception:
+                pass
         self._emit_status("stopped", {"reason": "stop requested"})
 
     # -- status helper --------------------------------------------------------
@@ -1986,6 +2012,18 @@ class WebSocketTransport:
             await session.close()
         except Exception:
             pass
+
+    async def _send_text(self, ws: Any, frame: str) -> None:
+        """Send one DDP frame, serialized against concurrent senders.
+
+        ``_read_loop`` (heartbeat ping / probe pong) and
+        ``_subscription_refresh_loop`` (room subscriptions) both write to the
+        same socket.  aiohttp sends are not atomic across awaits, so without a
+        lock two coroutines could interleave partial frames and corrupt the
+        protocol stream; the lock keeps every write whole.
+        """
+        async with self._ws_send_lock:
+            await _ws_send_text(ws, frame)
 
     # -- receive loop ---------------------------------------------------------
 
@@ -2048,7 +2086,7 @@ class WebSocketTransport:
                 )
             except asyncio.TimeoutError as _timeout:
                 # No traffic for a while — probe the connection with a ping
-                await _ws_send_text(ws, json.dumps({"msg": "ping"}))
+                await self._send_text(ws, json.dumps({"msg": "ping"}))
                 try:
                     frame = await asyncio.wait_for(
                         _ws_recv_text(ws), timeout=self._ping_timeout
@@ -2143,7 +2181,7 @@ class WebSocketTransport:
         """Perform DDP ``connect`` → ``connected`` → ``login``."""
 
         # 1. Send connect
-        await _ws_send_text(
+        await self._send_text(
             ws,
             json.dumps(
                 {
@@ -2168,10 +2206,10 @@ class WebSocketTransport:
                     f"DDP handshake failed (version mismatch): {str(msg)[:200]}"
                 )
             if msg.get("msg") == "ping":
-                await _ws_send_text(ws, json.dumps({"msg": "pong"}))
+                await self._send_text(ws, json.dumps({"msg": "pong"}))
 
         # 3. Send login
-        await _ws_send_text(
+        await self._send_text(
             ws,
             json.dumps(
                 {
@@ -2206,7 +2244,7 @@ class WebSocketTransport:
                     )
                 break
             if msg.get("msg") == "ping":
-                await _ws_send_text(ws, json.dumps({"msg": "pong"}))
+                await self._send_text(ws, json.dumps({"msg": "pong"}))
 
     # -- subscriptions --------------------------------------------------------
 
@@ -2248,7 +2286,7 @@ class WebSocketTransport:
             sub_id = f"sub-{room_id}"
             self._sub_ids[sub_id] = time.monotonic()
             self._subscribed_rooms.add(room_id)
-            await _ws_send_text(
+            await self._send_text(
                 ws,
                 json.dumps(
                     {
@@ -2274,7 +2312,7 @@ class WebSocketTransport:
         msg_type = msg.get("msg", "")
 
         if msg_type == "ping":
-            await _ws_send_text(ws, json.dumps({"msg": "pong"}))
+            await self._send_text(ws, json.dumps({"msg": "pong"}))
         elif msg_type == "changed":
             await self._handle_changed(msg)
 
@@ -2729,12 +2767,13 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 error="send_path_degraded",
             )
 
+        # Partial-delivery reporting flags: initialized OUTSIDE the try so
+        # the except handlers always see a bound name even if a pre-loop
+        # helper raised first.
+        first_message_id = ""
+        posted_any = False
+
         try:
-            # Initialize before anything that can raise: the exception
-            # handlers read these (partial-delivery reporting) and must
-            # never hit an unbound name.
-            first_message_id = ""
-            posted_any = False
             # Chunk oversized content at paragraph/line boundaries instead of
             # hard-truncating it (splits_long_messages = True).  Every chunk
             # is posted into the same room/thread; the first chunk consumes
@@ -3580,8 +3619,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 "reply_to_author_id": ctx.get("author_id", ""),
                 "reply_to_author_name": ctx.get("author_name", ""),
                 "reply_to_is_own_message": bool(
-                    ctx.get("author_id")
-                    and ctx.get("author_id") == self._bot_user_id()
+                    ctx.get("author_id") and ctx.get("author_id") == self._bot_user_id()
                 ),
                 "raw_payload": raw_event,
                 "platform": "rocketchat",
