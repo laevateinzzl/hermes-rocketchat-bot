@@ -136,3 +136,82 @@ async def test_ws_reauthenticate_success_skips_callback():
     await transport._reauthenticate()
 
     assert failures == []
+
+
+@pytest.mark.asyncio
+async def test_ws_reauthenticate_transient_failure_does_not_invoke_fatal_callback():
+    """During restart, 502/timeout in _reauthenticate() must NOT mark auth fatal."""
+    failures = []
+
+    def on_auth_failure(message):
+        failures.append(message)
+
+    class RestartingServerClient:
+        async def initialize(self):
+            raise RocketChatClientError(
+                "Token verification failed: GET /api/v1/me failed: "
+                "HTTP 502: Bad Gateway"
+            )
+
+        @property
+        def server_url(self):
+            return "https://chat.example.com"
+
+    adapter = RocketChatAdapter(
+        RocketChatConfig(
+            server_url="https://chat.example.com",
+            auth_mode="token",
+            user_id="u1",
+            access_token="tok",
+        )
+    )
+    adapter._running = True
+    adapter._connected = True
+
+    transport = WebSocketTransport(
+        RestartingServerClient(),
+        on_auth_failure=lambda msg: (
+            on_auth_failure(msg),
+            adapter._mark_auth_fatal(msg),
+        ),
+    )
+
+    await transport._reauthenticate()
+
+    assert failures == []
+    assert not adapter.has_fatal_error
+    assert adapter._running
+
+
+@pytest.mark.asyncio
+async def test_adapter_transport_failed_status_notifies_gateway_retryable():
+    """When WebSocketTransport gives up, adapter notifies gateway as retryable."""
+    adapter = RocketChatAdapter(
+        RocketChatConfig(
+            server_url="https://chat.example.com",
+            auth_mode="token",
+            user_id="u1",
+            access_token="tok",
+        )
+    )
+    adapter._connected = True
+    adapter._running = True
+    notified = []
+
+    async def fake_notify():
+        notified.append(True)
+
+    adapter._notify_fatal_error = fake_notify  # type: ignore[method-assign]
+
+    adapter._on_transport_status(
+        "failed", {"attempts": 5, "reason": "Connection refused"}
+    )
+    import asyncio
+
+    await asyncio.sleep(0.02)
+
+    assert not adapter._connected
+    assert adapter.has_fatal_error
+    assert adapter.fatal_error_retryable
+    assert notified == [True]
+

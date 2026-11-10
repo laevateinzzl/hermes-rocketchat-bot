@@ -947,5 +947,268 @@ async def test_ws_400_from_subscriptions_get_gives_up_not_loops():
 
     assert not transport._running
     assert "failed" in statuses
-    # The 400 was actually exercised on the subscription path.
+    # The 400 was exercised on the subscription path.
     assert client.calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_ws_server_restart_closes_stale_client_session_and_recovers():
+    """Full server update/restart simulation:
+    1. WS #1 connects and receives a message; REST client has a pooled session.
+    2. Server restarts: WS #1 closes, and the old REST session becomes stale
+       (raises ServerDisconnectedError unless client.close() is called).
+    3. WS #2 connects while server is still warming up: DDP login fails with
+       resume-token rejection, and _reauthenticate() hits HTTP 502 Bad Gateway.
+       Adapter must NOT be marked fatal!
+    4. WS #3 connects after server finishes booting: _reauthenticate() succeeds,
+       stale REST session was closed so list_subscriptions() succeeds, and
+       messages after restart are delivered.
+    """
+
+    class _ServerRestartClient(FakeWSClient):
+        def __init__(self):
+            super().__init__(
+                subscriptions=[{"rid": "room-after", "_id": "sub1", "t": "d"}]
+            )
+            self.session_stale = False
+            self.close_calls = 0
+            self.init_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+            self.session_stale = False
+
+        async def initialize(self):
+            self.init_calls += 1
+            if self.session_stale:
+                raise RocketChatClientError(
+                    "Token verification failed: Server disconnected"
+                )
+            if self.init_calls == 1:
+                # Server still restarting (502 Bad Gateway)
+                raise RocketChatClientError(
+                    "Token verification failed: GET /api/v1/me failed: "
+                    "HTTP 502: Bad Gateway"
+                )
+            self._access_token = "fresh-token"
+            return True
+
+        async def list_subscriptions(self):
+            if self.session_stale:
+                raise RocketChatClientError(
+                    "GET /api/v1/subscriptions.get failed: Server disconnected"
+                )
+            return await super().list_subscriptions()
+
+    client = _ServerRestartClient()
+    fatal_errors: list[str] = []
+    received: list[dict] = []
+    statuses: list[str] = []
+
+    ws1 = FakeWebSocket(
+        [
+            _connected_frame(),
+            _login_result(),
+            _room_message(msg_id="before-restart", room_id="room-after", text="before"),
+        ]
+    )
+    # After ws1 drains, simulate the server restart poisoning the pooled REST session
+    ws2 = FakeWebSocket(
+        [
+            _connected_frame(),
+            json.dumps(
+                {
+                    "msg": "result",
+                    "id": "1",
+                    "error": {
+                        "error": 403,
+                        "message": (
+                            "You've been logged out by the server. "
+                            "Please log in again. [403]"
+                        ),
+                    },
+                }
+            ),
+        ]
+    )
+    ws3 = FakeWebSocket(
+        [
+            _connected_frame(),
+            _login_result(),
+            _room_message(msg_id="after-restart", room_id="room-after", text="after"),
+        ]
+    )
+    sockets = [ws1, ws2, ws3]
+    attempt = {"n": 0}
+
+    async def ws_factory():
+        idx = min(attempt["n"], len(sockets) - 1)
+        attempt["n"] += 1
+        if idx == 1:
+            # Server just restarted before attempt #2; pooled REST session is dead
+            # unless the transport closed the client session on WS #1 teardown.
+            pass
+        return sockets[idx]
+
+    # Mark the client session as active during ws1, then stale when ws1 drops:
+    orig_recv = ws1.recv
+
+    async def recv_then_stale():
+        try:
+            return await orig_recv()
+        except ConnectionError:
+            client.session_stale = True
+            raise
+
+    ws1.recv = recv_then_stale  # type: ignore[method-assign]
+
+    transport = WebSocketTransport(
+        client=client,
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=ws_factory,
+        reconnect_initial_delay=0.01,
+        reconnect_max_delay=0.02,
+        reconnect_jitter=0.0,
+        on_auth_failure=lambda msg: fatal_errors.append(msg),
+    )
+
+    async def on_msg(msg):
+        received.append(msg)
+        if msg.get("_id") == "after-restart":
+            transport._running = False
+
+    transport.set_on_message(on_msg)
+    transport.set_on_status(lambda s, d: statuses.append(s))
+
+    await transport.start()
+    await asyncio.wait_for(transport._task, timeout=1.5)  # type: ignore[arg-type]
+
+    assert [m["_id"] for m in received] == ["before-restart", "after-restart"]
+    assert fatal_errors == []
+    assert client.close_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_ws_handshake_times_out_when_server_only_sends_pings_and_echoes_ping_id():
+    """If a restarting server sends periodic DDP pings faster than receive_timeout
+    without answering 'login', _handshake must still time out and echo ping id."""
+
+    class _InfinitePingWebSocket:
+        def __init__(self):
+            self.sent_frames: list[str] = []
+            self._connected_sent = False
+            self._ping_idx = 0
+
+        async def send(self, data: str):
+            self.sent_frames.append(data)
+
+        async def recv(self) -> str:
+            if not self._connected_sent:
+                self._connected_sent = True
+                return _connected_frame()
+            await asyncio.sleep(0.015)
+            self._ping_idx += 1
+            return json.dumps({"msg": "ping", "id": f"ping-{self._ping_idx}"})
+
+        async def close(self):
+            pass
+
+    ws = _InfinitePingWebSocket()
+    transport = WebSocketTransport(
+        client=FakeWSClient(),
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=_factory(ws),
+        receive_timeout=0.05,
+        ping_timeout=0.03,
+    )
+    transport._running = True
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(transport._handshake(ws), timeout=0.3)
+
+    pongs = [
+        json.loads(f) for f in ws.sent_frames if json.loads(f).get("msg") == "pong"
+    ]
+    assert len(pongs) >= 1
+    assert pongs[0].get("id") == "ping-1"
+
+
+@pytest.mark.asyncio
+async def test_ws_read_loop_wedged_ping_send_times_out_into_connection_error():
+    """If the TCP send buffer is wedged when probing an idle connection with
+    a DDP ping, _read_loop must time out and raise ConnectionError."""
+
+    class _WedgedSendWebSocket:
+        async def recv(self) -> str:
+            await asyncio.sleep(10)
+            return ""
+
+        async def send(self, data: str):
+            await asyncio.sleep(10)
+
+        async def close(self):
+            pass
+
+    ws = _WedgedSendWebSocket()
+    transport = WebSocketTransport(
+        client=FakeWSClient(),
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=_factory(ws),
+        receive_timeout=0.02,
+        ping_timeout=0.02,
+    )
+    transport._running = True
+
+    with pytest.raises(ConnectionError, match="WebSocket unresponsive"):
+        await asyncio.wait_for(transport._read_loop(ws), timeout=0.3)
+
+
+def test_ws_reconnect_delay_does_not_overflow_after_1024_attempts():
+    """At attempt >= 1024, 1.0 * (2 ** attempt) overflows IEEE-754 float in Python.
+
+    Regression for production incident where a ~17-hour server outage killed
+    the WebSocket reconnect loop with OverflowError on attempt 1024.
+    """
+    transport = WebSocketTransport(
+        client=FakeWSClient(),
+        ws_url="wss://chat.example.com/websocket",
+        reconnect_initial_delay=1.0,
+        reconnect_max_delay=60.0,
+        reconnect_jitter=0.0,
+    )
+    for attempt in (1023, 1024, 2048, 100_000):
+        transport._reconnect_attempts = attempt
+        assert transport._next_reconnect_delay() == pytest.approx(60.0)
+
+
+@pytest.mark.asyncio
+async def test_ws_nosub_frame_evicts_room_and_raises_on_error():
+    """A DDP nosub frame must drop the room from _subscribed_rooms and raise on error."""
+    ws = FakeWebSocket()
+    transport = WebSocketTransport(
+        client=FakeWSClient(),
+        ws_url="wss://chat.example.com/websocket",
+        ws_factory=_factory(ws),
+    )
+    transport._subscribed_rooms.add("GENERAL")
+    await transport._handle_frame(
+        json.dumps({"msg": "nosub", "id": "sub-GENERAL"}), ws
+    )
+    assert "GENERAL" not in transport._subscribed_rooms
+
+    transport._subscribed_rooms.add("GENERAL")
+    with pytest.raises(RocketChatClientError, match="DDP subscription sub-GENERAL"):
+        await transport._handle_frame(
+            json.dumps(
+                {
+                    "msg": "nosub",
+                    "id": "sub-GENERAL",
+                    "error": {"error": 401, "message": "Not authorized [401]"},
+                }
+            ),
+            ws,
+        )
+    assert "GENERAL" not in transport._subscribed_rooms
+
+
+

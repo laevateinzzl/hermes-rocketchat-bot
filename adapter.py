@@ -533,6 +533,14 @@ async def _ws_send_text(ws: Any, frame: str) -> None:
     raise RocketChatClientError("WebSocket object does not support text send")
 
 
+def _ddp_pong_frame(msg: dict[str, Any]) -> str:
+    """Build a DDP pong frame, echoing the incoming ping id when present."""
+    pong: dict[str, Any] = {"msg": "pong"}
+    if "id" in msg:
+        pong["id"] = msg["id"]
+    return json.dumps(pong)
+
+
 async def _ws_recv_text(ws: Any) -> str:
     """Receive a text frame across websockets and aiohttp websocket shapes."""
     recv = getattr(ws, "recv", None)
@@ -543,6 +551,16 @@ async def _ws_recv_text(ws: Any) -> str:
         if receive is None:
             raise RocketChatClientError("WebSocket object does not support receive")
         message = await _maybe_await(receive())
+        msg_type = getattr(message, "type", None)
+        if msg_type is not None:
+            type_name = getattr(msg_type, "name", str(msg_type)).upper()
+            if type_name in {"CLOSE", "CLOSING", "CLOSED", "ERROR"} or msg_type in (
+                8,
+                256,
+                257,
+                258,
+            ):
+                raise ConnectionError(f"WebSocket closed or error (type={type_name})")
         frame = getattr(message, "data", message)
 
     if isinstance(frame, bytes):
@@ -771,7 +789,11 @@ class RocketChatClient:
             raise RocketChatClientError(f"Token verification failed: {exc}") from exc
 
         if not data.get("success") or not data.get("_id"):
-            raise RocketChatClientError("Token verification failed: invalid response")
+            detail = data.get("error") or data.get("message") or ""
+            suffix = f": {detail}" if detail else ""
+            raise RocketChatClientError(
+                f"Token verification failed: invalid response{suffix}"
+            )
 
         identity = RocketChatIdentity(
             user_id=data.get("_id", self._user_id),
@@ -1565,17 +1587,24 @@ class PollingTransport:
                 # forever with no recovery path.
                 if _is_auth_failure_message(str(exc)):
                     log.warning("Polling auth failure (%s); re-authenticating", exc)
+                    closer = getattr(self._client, "close", None)
+                    if callable(closer):
+                        try:
+                            await closer()
+                        except Exception:
+                            pass
                     try:
                         await self._client.initialize()
                         log.info("Re-authentication succeeded")
                     except Exception as reauth_exc:
                         log.exception("Re-authentication failed")
-                        callback = self._on_auth_failure
-                        if callable(callback):
-                            try:
-                                callback(str(reauth_exc))
-                            except Exception:
-                                pass
+                        if _is_auth_failure_message(str(reauth_exc)):
+                            callback = self._on_auth_failure
+                            if callable(callback):
+                                try:
+                                    callback(str(reauth_exc))
+                                except Exception:
+                                    pass
                         await asyncio.sleep(self.poll_interval)
                         continue
                 else:
@@ -1905,6 +1934,7 @@ class WebSocketTransport:
         self._jitter = max(0.0, min(0.5, _parse_float_safe(reconnect_jitter, 0.25)))
         # Reconnect bookkeeping (reset on a successful handshake)
         self._reconnect_attempts = 0
+        self._needs_reauth = False
         # aiohttp session owned by the default factory, closed on reconnect/stop
         self._http_session: Any = None
         # Serializes every DDP frame write: the heartbeat/_read_loop and the
@@ -1931,6 +1961,7 @@ class WebSocketTransport:
         """Begin the WebSocket receive loop in the background."""
         self._running = True
         self._reconnect_attempts = 0
+        self._needs_reauth = False
         self._task = asyncio.create_task(self._receive_loop())
 
     async def stop(self) -> None:
@@ -1949,12 +1980,7 @@ class WebSocketTransport:
         # stopped transport leaks the client's HTTP connection pool.  The
         # adapter recreates the client on the next connect() and the client's
         # own close() is idempotent, so this is safe to call unconditionally.
-        closer = getattr(self._client, "close", None)
-        if callable(closer):
-            try:
-                await closer()
-            except Exception:
-                pass
+        await self._close_client_session()
         self._emit_status("stopped", {"reason": "stop requested"})
 
     # -- status helper --------------------------------------------------------
@@ -1976,7 +2002,10 @@ class WebSocketTransport:
         """Compute the next reconnect delay using exponential backoff + jitter."""
         import random
 
-        base = self._initial_delay * (2**self._reconnect_attempts)
+        # Cap the exponent so 2**exp never overflows IEEE-754 float at
+        # attempt >= 1024 during multi-hour server outages.
+        exp = min(max(0, self._reconnect_attempts), 30)
+        base = self._initial_delay * (2**exp)
         base = min(base, self._max_delay)
         jitter = base * self._jitter
         return base + random.uniform(-jitter, jitter)
@@ -1998,9 +2027,27 @@ class WebSocketTransport:
 
         # Close the previous session before opening a new one to avoid fd leaks
         await self._close_http_session()
-        session = aiohttp.ClientSession()
+        timeout_cls = getattr(aiohttp, "ClientTimeout", None)
+        if callable(timeout_cls):
+            session = aiohttp.ClientSession(
+                timeout=timeout_cls(
+                    total=self._receive_timeout,
+                    connect=self._receive_timeout,
+                    sock_connect=self._receive_timeout,
+                    sock_read=self._receive_timeout,
+                )
+            )
+        else:
+            session = aiohttp.ClientSession()
         self._http_session = session
-        return await session.ws_connect(self.ws_url)
+        try:
+            return await session.ws_connect(
+                self.ws_url,
+                heartbeat=self._ping_timeout,
+                autoping=True,
+            )
+        except TypeError:
+            return await session.ws_connect(self.ws_url)
 
     async def _close_http_session(self) -> None:
         """Close the aiohttp session owned by the default factory, if any."""
@@ -2013,6 +2060,36 @@ class WebSocketTransport:
         except Exception:
             pass
 
+    async def _close_client_session(self) -> None:
+        """Close the shared REST client session to drop stale pooled sockets."""
+        closer = getattr(self._client, "close", None)
+        if callable(closer):
+            try:
+                await closer()
+            except Exception:
+                pass
+
+    async def _cleanup_attempt(self, ws: Any) -> None:
+        """Tear down tasks and sockets from a finished/failed WebSocket attempt."""
+        refresh_task = self._subscription_refresh_task
+        self._subscription_refresh_task = None
+        if refresh_task is not None:
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._subscribed_rooms.clear()
+        if ws is not None and not getattr(ws, "closed", False):
+            try:
+                await asyncio.wait_for(
+                    ws.close(), timeout=min(self._ping_timeout, 5.0)
+                )
+            except (asyncio.TimeoutError, Exception):
+                pass
+        await self._close_http_session()
+        await self._close_client_session()
+
     async def _send_text(self, ws: Any, frame: str) -> None:
         """Send one DDP frame, serialized against concurrent senders.
 
@@ -2023,7 +2100,9 @@ class WebSocketTransport:
         protocol stream; the lock keeps every write whole.
         """
         async with self._ws_send_lock:
-            await _ws_send_text(ws, frame)
+            await asyncio.wait_for(
+                _ws_send_text(ws, frame), timeout=self._ping_timeout
+            )
 
     # -- receive loop ---------------------------------------------------------
 
@@ -2036,6 +2115,14 @@ class WebSocketTransport:
         while self._running:
             ws = None
             try:
+                if self._needs_reauth:
+                    await self._reauthenticate()
+                    if not self._running:
+                        break
+                    if self._needs_reauth:
+                        raise RocketChatClientError(
+                            "Re-authentication still pending; retrying after backoff"
+                        )
                 ws = await self._ws_factory()
                 await self._handshake(ws)
                 await self._bootstrap_subscriptions(ws)
@@ -2050,26 +2137,21 @@ class WebSocketTransport:
                 await self._read_loop(ws)
 
             except asyncio.CancelledError as _exc:
+                await self._cleanup_attempt(ws)
                 raise
             except Exception as exc:
-                await self._handle_connection_error(exc, log)
+                await self._cleanup_attempt(ws)
+                ws = None
+                try:
+                    await self._handle_connection_error(exc, log)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Unexpected error in WebSocket reconnect handler")
+                    if self._running:
+                        await asyncio.sleep(self._initial_delay)
             finally:
-                refresh_task = self._subscription_refresh_task
-                self._subscription_refresh_task = None
-                if refresh_task is not None:
-                    refresh_task.cancel()
-                    try:
-                        await refresh_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                self._subscribed_rooms.clear()
-                if ws is not None:
-                    try:
-                        await ws.close()
-                    except Exception as _close_exc:
-                        pass
-                # Always release the session tied to this attempt
-                await self._close_http_session()
+                await self._cleanup_attempt(ws)
 
     async def _read_loop(self, ws: Any) -> None:
         """Read frames with a heartbeat timeout.
@@ -2086,8 +2168,8 @@ class WebSocketTransport:
                 )
             except asyncio.TimeoutError as _timeout:
                 # No traffic for a while — probe the connection with a ping
-                await self._send_text(ws, json.dumps({"msg": "ping"}))
                 try:
+                    await self._send_text(ws, json.dumps({"msg": "ping"}))
                     frame = await asyncio.wait_for(
                         _ws_recv_text(ws), timeout=self._ping_timeout
                     )
@@ -2114,6 +2196,7 @@ class WebSocketTransport:
         # restart that invalidated the resume token recovers.
         if self._is_auth_error(exc):
             log.warning("WebSocket auth error (%s); re-authenticating", exc)
+            self._needs_reauth = True
             await self._reauthenticate()
         if not self._running:
             return
@@ -2154,31 +2237,39 @@ class WebSocketTransport:
             or "unauthorized" in text
             or "token" in text
             or "resume" in text
+            or _is_auth_failure_message(text)
         )
 
     async def _reauthenticate(self) -> None:
         """Re-run client initialization to obtain a fresh auth token."""
+        await self._close_client_session()
         try:
             await self._client.initialize()
+            self._needs_reauth = False
         except Exception as exc:
             import logging
 
             logging.getLogger(__name__).warning(
                 "Re-authentication failed; will retry on next reconnect"
             )
-            # Surface the failure to the adapter so a permanently invalid
-            # credential can be reported as a fatal (non-retryable) error.
-            callback = self._on_auth_failure
-            if callable(callback):
-                try:
-                    callback(str(exc))
-                except Exception:
-                    pass
+            self._needs_reauth = True
+            # Surface the failure to the adapter only when the error is a
+            # definitive credential rejection (401/403/invalid token).
+            # Transient errors while the server is restarting (502/503,
+            # timeouts, connection resets) must remain retryable.
+            if _is_auth_failure_message(str(exc)):
+                callback = self._on_auth_failure
+                if callable(callback):
+                    try:
+                        callback(str(exc))
+                    except Exception:
+                        pass
 
     # -- DDP handshake --------------------------------------------------------
 
     async def _handshake(self, ws: Any) -> None:
         """Perform DDP ``connect`` → ``connected`` → ``login``."""
+        import time
 
         # 1. Send connect
         await self._send_text(
@@ -2192,9 +2283,16 @@ class WebSocketTransport:
             ),
         )
 
-        # 2. Wait for "connected"
+        # 2. Wait for "connected" (bounded by overall stage deadline so
+        # periodic DDP pings from a half-started server cannot loop forever)
+        connect_deadline = time.monotonic() + self._receive_timeout
         while self._running:
-            frame = await asyncio.wait_for(_ws_recv_text(ws), self._receive_timeout)
+            remaining = connect_deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(
+                    "DDP handshake timed out waiting for connected"
+                )
+            frame = await asyncio.wait_for(_ws_recv_text(ws), remaining)
             msg = _decode_ddp_frame(frame)
             if msg is None:
                 continue
@@ -2206,7 +2304,7 @@ class WebSocketTransport:
                     f"DDP handshake failed (version mismatch): {str(msg)[:200]}"
                 )
             if msg.get("msg") == "ping":
-                await self._send_text(ws, json.dumps({"msg": "pong"}))
+                await self._send_text(ws, _ddp_pong_frame(msg))
 
         # 3. Send login
         await self._send_text(
@@ -2221,9 +2319,15 @@ class WebSocketTransport:
             ),
         )
 
-        # 4. Wait for login result
+        # 4. Wait for login result (bounded by overall stage deadline)
+        login_deadline = time.monotonic() + self._receive_timeout
         while self._running:
-            frame = await asyncio.wait_for(_ws_recv_text(ws), self._receive_timeout)
+            remaining = login_deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(
+                    "DDP handshake timed out waiting for login result"
+                )
+            frame = await asyncio.wait_for(_ws_recv_text(ws), remaining)
             msg = _decode_ddp_frame(frame)
             if msg is None:
                 continue
@@ -2244,7 +2348,7 @@ class WebSocketTransport:
                     )
                 break
             if msg.get("msg") == "ping":
-                await self._send_text(ws, json.dumps({"msg": "pong"}))
+                await self._send_text(ws, _ddp_pong_frame(msg))
 
     # -- subscriptions --------------------------------------------------------
 
@@ -2285,7 +2389,6 @@ class WebSocketTransport:
 
             sub_id = f"sub-{room_id}"
             self._sub_ids[sub_id] = time.monotonic()
-            self._subscribed_rooms.add(room_id)
             await self._send_text(
                 ws,
                 json.dumps(
@@ -2297,6 +2400,7 @@ class WebSocketTransport:
                     }
                 ),
             )
+            self._subscribed_rooms.add(room_id)
 
     async def _bootstrap_subscriptions(self, ws: Any) -> None:
         """Subscribe to ``stream-room-messages`` for every joined room."""
@@ -2312,9 +2416,21 @@ class WebSocketTransport:
         msg_type = msg.get("msg", "")
 
         if msg_type == "ping":
-            await self._send_text(ws, json.dumps({"msg": "pong"}))
+            await self._send_text(ws, _ddp_pong_frame(msg))
         elif msg_type == "changed":
             await self._handle_changed(msg)
+        elif msg_type == "nosub":
+            sub_id = str(msg.get("id") or "")
+            if sub_id.startswith("sub-"):
+                self._subscribed_rooms.discard(sub_id[4:])
+            if msg.get("error"):
+                raise RocketChatClientError(
+                    f"DDP subscription {sub_id} failed: {msg.get('error')}"
+                )
+        elif msg_type == "error":
+            raise RocketChatClientError(
+                f"DDP error frame: {msg.get('reason') or msg}"
+            )
 
     async def _handle_changed(self, msg: dict) -> None:
         """Handle a DDP ``changed`` frame from ``stream-room-messages``."""
@@ -2477,13 +2593,34 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         """Store the Hermes message handler for inbound dispatch."""
         self._message_handler = handler
 
+    def _schedule_fatal_notification(self) -> None:
+        """Schedule ``_notify_fatal_error()`` on the running loop when available."""
+        notify = getattr(self, "_notify_fatal_error", None)
+        if not callable(notify):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(notify())
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+
     def _on_transport_status(self, status: str, detail: dict[str, Any]) -> None:
-        """Log WebSocket transport status changes for observability."""
+        """Log WebSocket transport status changes and sync adapter state."""
         import logging
 
         log = logging.getLogger(__name__)
         if status == "connected":
             log.info("Rocket.Chat WebSocket connected")
+            self._connected = True
+            self._running = True
+            mark_connected = getattr(self, "_mark_connected", None)
+            if callable(mark_connected):
+                try:
+                    mark_connected()
+                except Exception:
+                    pass
         elif status == "reconnecting":
             log.warning(
                 "Rocket.Chat WebSocket reconnecting (attempt %s, delay %.1fs): %s",
@@ -2497,6 +2634,22 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 detail.get("attempts"),
                 detail.get("reason", ""),
             )
+            self._connected = False
+            setter = getattr(self, "_set_fatal_error", None)
+            if callable(setter) and not getattr(self, "has_fatal_error", False):
+                try:
+                    setter(
+                        "WEBSOCKET_RECONNECT_FAILED",
+                        (
+                            "Rocket.Chat WebSocket reconnect failed after "
+                            f"{detail.get('attempts')} attempts: "
+                            f"{detail.get('reason', '')}"
+                        ),
+                        retryable=True,
+                    )
+                except Exception:
+                    pass
+            self._schedule_fatal_notification()
         elif status == "stopped":
             log.info("Rocket.Chat WebSocket transport stopped")
 
@@ -3345,8 +3498,11 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
         supports it; degrades to a no-op on older Hermes versions (the
         adapter still fails closed by returning False from connect()).
         """
+        if not _is_auth_failure_message(message):
+            return
         if getattr(self, "has_fatal_error", False):
             return
+        was_connected = bool(getattr(self, "_connected", False))
         setter = getattr(self, "_set_fatal_error", None)
         if callable(setter):
             try:
@@ -3357,6 +3513,9 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
                 )
             except Exception:
                 pass
+        if was_connected:
+            self._connected = False
+            self._schedule_fatal_notification()
 
     # -- inbound callback -----------------------------------------------------
 
@@ -3713,8 +3872,9 @@ def _is_auth_failure_message(message: str) -> bool:
     """Return True when an error string indicates a definitive auth failure.
 
     Matches HTTP 401/403 responses and Rocket.Chat's invalid-token/credential
-    phrasing.  Transient failures (timeouts, connection refused) never match,
-    so the gateway keeps them retryable.
+    phrasing.  Transient failures (timeouts, connection refused, or malformed
+    200 responses while a server/proxy is restarting) never match, so the
+    gateway keeps them retryable.
     """
     lowered = str(message).lower()
     markers = (
@@ -3723,9 +3883,10 @@ def _is_auth_failure_message(message: str) -> bool:
         "unauthorized",
         "forbidden",
         "invalid token",
-        "invalid response",
         "invalid-user",
         "invalid user",
+        "you must be logged in",
+        "totp-required",
     )
     return any(marker in lowered for marker in markers)
 

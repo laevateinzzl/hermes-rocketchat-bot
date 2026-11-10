@@ -428,3 +428,52 @@ async def test_polling_stop_tolerates_client_without_close():
     await transport.start()
     await asyncio.sleep(0.05)
     await transport.stop()  # no exception
+
+
+@pytest.mark.asyncio
+async def test_poll_reauth_transient_failure_during_restart_does_not_report_fatal():
+    """If polling triggers re-auth while the server is restarting (502/503),
+    it must close the stale session and NOT report a permanent fatal error."""
+    import asyncio
+
+    class _RestartingPollClient(FakePollingClient):
+        def __init__(self):
+            super().__init__()
+            self.close_calls = 0
+            self.init_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+
+        async def initialize(self):
+            self.init_calls += 1
+            raise RocketChatClientError(
+                "Token verification failed: GET /api/v1/me failed: "
+                "HTTP 503: Service Unavailable"
+            )
+
+        async def list_subscriptions(self, updated_since=None):
+            raise RocketChatClientError("HTTP 401: Unauthorized")
+
+    client = _RestartingPollClient()
+    fatal: list[str] = []
+    transport = PollingTransport(
+        client,
+        poll_interval=0.01,
+        on_auth_failure=lambda m: fatal.append(m),
+    )
+    transport._running = True
+
+    task = asyncio.create_task(transport._poll_loop())
+    await asyncio.sleep(0.06)
+    transport._running = False
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    assert client.close_calls >= 1
+    assert client.init_calls >= 1
+    assert fatal == []
+
