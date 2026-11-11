@@ -14,6 +14,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, TypeVar
+from urllib.parse import quote
 
 _KT = TypeVar("_KT")
 _VT = TypeVar("_VT")
@@ -97,13 +98,43 @@ def _parse_csv(value: str | list[str] | None) -> list[str]:
     return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
-def parse_config(extra: dict[str, Any] | None = None) -> RocketChatConfig:
-    """Parse Rocket.Chat configuration from environment and extra dict.
+def _config_extra(extra: Any) -> dict[str, Any]:
+    """Return the adapter-specific settings mapping from a config object.
 
-    Extra values override environment variables for explicitly-set keys.
+    Hermes calls a plugin's ``standalone_sender_fn`` with a
+    ``gateway.config.PlatformConfig`` rather than a plain dict.  Its
+    platform-specific keys live in ``.extra`` (``from_dict`` promotes
+    top-level adapter keys there).  Keep accepting dicts for tests and
+    out-of-process callers.
     """
     if extra is None:
-        extra = {}
+        return {}
+    if isinstance(extra, dict):
+        return extra
+    nested = getattr(extra, "extra", None)
+    if isinstance(nested, dict):
+        return nested
+    to_dict = getattr(extra, "to_dict", None)
+    if callable(to_dict):
+        try:
+            data = to_dict()
+        except Exception:
+            return {}
+        if isinstance(data, dict):
+            nested = data.get("extra")
+            if isinstance(nested, dict):
+                return nested
+            return data
+    return {}
+
+
+def parse_config(extra: Any = None) -> RocketChatConfig:
+    """Parse Rocket.Chat configuration from environment and extra settings.
+
+    ``extra`` may be a plain dict or a Hermes ``PlatformConfig`` object.
+    Extra values override environment variables for explicitly-set keys.
+    """
+    extra = _config_extra(extra)
 
     def _get(key: str, default: Any = "") -> str:
         return str(
@@ -952,28 +983,26 @@ class RocketChatClient:
         last_update=None,
         room_type: str = "",
     ) -> dict:
-        """Sync messages for a room, falling back for older Rocket.Chat servers."""
-        payload: dict[str, Any] = {"roomId": room_id}
+        """Sync messages for a room, falling back for older servers.
+
+        Rocket.Chat 9.0 defines ``chat.syncMessages`` as ``GET`` with
+        ``roomId`` / ``lastUpdate`` query parameters.  The response is
+        ``{success, result: {updated, deleted, cursor}}``; older servers may
+        not implement the endpoint at all, hence the history fallback.
+        """
+        params: dict[str, Any] = {"roomId": room_id}
         if last_update:
-            payload["lastUpdate"] = last_update
+            params["lastUpdate"] = last_update
+
         try:
-            return await self._request(
-                "POST", "/api/v1/chat.syncMessages", json=payload
-            )
-        except RocketChatNotFoundError as exc:
-            if "HTTP 404" not in str(exc):
-                raise
-            if not room_type:
-                raise
-            return await self.history_messages(
-                room_id=room_id,
-                room_type=room_type,
-                oldest=last_update,
+            data = await self._request(
+                "GET", "/api/v1/chat.syncMessages", params=params
             )
         except RocketChatClientError as exc:
-            # Older servers reject chat.syncMessages with a 400 instead of a
-            # 404 — same fallback applies.
-            if "HTTP 400" not in str(exc):
+            # Missing endpoint (404) or an older/incompatible implementation
+            # (400/405): fall back to room history when the room type is known.
+            text = str(exc)
+            if not any(f"HTTP {status}" in text for status in (400, 404, 405)):
                 raise
             if not room_type:
                 raise
@@ -982,6 +1011,13 @@ class RocketChatClient:
                 room_type=room_type,
                 oldest=last_update,
             )
+
+        result = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(result, dict):
+            result = data if isinstance(data, dict) else {}
+        updated = result.get("updated") or []
+        deleted = result.get("deleted") or result.get("removed") or []
+        return {"updated": updated, "removed": deleted}
 
     async def history_messages(
         self,
@@ -1115,11 +1151,16 @@ class RocketChatClient:
     ) -> dict:
         """Upload a local file to a Rocket.Chat room.
 
-        Uses the three-step Rocket.Chat file-upload flow:
-        1. ``POST /api/v1/rooms.media/{roomId}``  — upload the file as real
+        Rocket.Chat's two-step upload flow already creates the file message:
+
+        1. ``POST /api/v1/rooms.media/{roomId}`` — upload the file as real
            multipart form data (the file bytes, not just metadata)
         2. ``POST /api/v1/rooms.mediaConfirm/{roomId}/{fileId}`` — confirm
-        3. ``POST /api/v1/chat.postMessage`` — post the text message with file ref
+           the upload and create the message, with ``msg`` and ``tmid``
+
+        Do **not** call ``chat.postMessage`` with a ``file`` field afterwards:
+        Rocket.Chat 9.0 validates that endpoint with
+        ``additionalProperties: false`` and rejects ``file`` with HTTP 400.
         """
         import mimetypes
         from pathlib import Path
@@ -1148,33 +1189,26 @@ class RocketChatClient:
             )
 
         file_id = upload_result.get("file", {}).get("_id", "")
+        if not file_id:
+            raise RocketChatClientError("Upload failed: no file id returned")
 
-        # Step 2 — confirm
-        if file_id:
-            confirm_payload: dict[str, str] = {"msg": text}
-            if tmid:
-                confirm_payload["tmid"] = tmid
-            await self._request(
-                "POST",
-                f"/api/v1/rooms.mediaConfirm/{room_id}/{file_id}",
-                json=confirm_payload,
-            )
-
-        # Step 3 — post message with file reference
-        payload: dict[str, Any] = {"roomId": room_id, "text": text}
+        # Step 2 — confirm. mediaConfirm creates and sends the file message;
+        # its `message` is the canonical result to return.
+        confirm_payload: dict[str, str] = {"msg": text}
         if tmid:
-            payload["tmid"] = tmid
-        if file_id:
-            payload["file"] = {"_id": file_id, "name": file_name}
+            confirm_payload["tmid"] = tmid
+        confirm_result = await self._request(
+            "POST",
+            f"/api/v1/rooms.mediaConfirm/{room_id}/{file_id}",
+            json=confirm_payload,
+        )
 
-        data = await self._request("POST", "/api/v1/chat.postMessage", json=payload)
-
-        if not data.get("success", False):
+        if not confirm_result.get("success", False):
             raise RocketChatClientError(
-                f"Send failed: {data.get('error', 'chat.postMessage failed')}"
+                f"Upload confirm failed: {confirm_result.get('error', 'unknown')}"
             )
 
-        return data.get("message", {})
+        return confirm_result.get("message", {}) or {}
 
 
 # ---------------------------------------------------------------------------
@@ -1192,61 +1226,157 @@ class AttachmentCandidate:
     rc_file_id: str = ""
 
 
+def _file_id_from_upload_url(url: str) -> str:
+    """Extract the upload id from a ``/file-upload/<id>/<name>`` URL."""
+    path = str(url or "").split("?", 1)[0]
+    marker = "/file-upload/"
+    if marker not in path:
+        return ""
+    return path.split(marker, 1)[1].split("/", 1)[0]
+
+
 def attachment_candidates_from_message(message: dict) -> list[AttachmentCandidate]:
-    """Extract attachment candidates from a Rocket.Chat message.
+    """Extract deduplicated attachment candidates from a Rocket.Chat message.
 
     Handles three Rocket.Chat attachment shapes:
-    - ``attachments``: array of rich attachment objects with ``image_url`` or ``title_link``
-    - ``file``: single file object with ``_id``, ``name``, ``type``
-    - ``files``: array of file objects
+
+    - ``files``: array of file objects (modern Rocket.Chat)
+    - ``file``: single file object (deprecated; only a fallback)
+    - ``attachments``: rich attachment objects with ``image_url`` /
+      ``title_link`` (link previews, or old messages without ``files``)
+
+    Rocket.Chat 9.0's ``sendFileMessage`` populates ``file``, ``files`` and
+    ``attachments`` for the same upload.  The ``files`` array is the source
+    of truth: it contains the original upload and any generated thumbnails.
+    Attachments that point at a file already in ``files`` are skipped, and
+    thumbnail files referenced by an attachment's ``image_url`` are skipped
+    so a single image does not arrive as both original and preview.
     """
     candidates: list[AttachmentCandidate] = []
+    seen_file_ids: set[str] = set()
+    seen_urls: set[str] = set()
 
-    # attachments field (rich link previews / image embeds)
-    for att in message.get("attachments") or []:
-        url = att.get("image_url") or att.get("title_link") or ""
+    def add(candidate: AttachmentCandidate) -> None:
+        fid = candidate.rc_file_id
+        url = candidate.url
+        if fid and fid in seen_file_ids:
+            return
+        if url and url in seen_urls:
+            return
+        if fid:
+            seen_file_ids.add(fid)
         if url:
-            candidates.append(
-                AttachmentCandidate(
-                    url=url,
-                    mime_type=att.get("image_type", ""),
-                    title=att.get("title", ""),
-                )
-            )
+            seen_urls.add(url)
+        candidates.append(candidate)
 
-    # files field (array, modern Rocket.Chat)
-    for f in message.get("files") or []:
-        candidates.append(
+    files = message.get("files")
+    if not isinstance(files, list):
+        files = []
+    attachments = message.get("attachments")
+    if not isinstance(attachments, list):
+        attachments = []
+
+    single = message.get("file")
+    if not isinstance(single, dict):
+        single = None
+    single_id = str(single.get("_id") or "") if single else ""
+
+    file_upload = message.get("fileUpload")
+    public_file_path = ""
+    if isinstance(file_upload, dict):
+        public_file_path = str(file_upload.get("publicFilePath") or "")
+
+    # An image attachment may use a thumbnail URL while its `fileId` and
+    # `title_link` point at the original upload.  Identify those generated
+    # preview files so `files` does not emit the thumbnail as a second media.
+    preview_file_ids: set[str] = set()
+    for att in attachments:
+        if not isinstance(att, dict) or att.get("type") != "file":
+            continue
+        image_url = str(att.get("image_url") or "")
+        title_link = str(att.get("title_link") or "")
+        if image_url and title_link and image_url != title_link:
+            preview_id = _file_id_from_upload_url(image_url)
+            original_id = _file_id_from_upload_url(title_link)
+            if preview_id and preview_id != original_id:
+                preview_file_ids.add(preview_id)
+
+    # `files` is authoritative: the first entry is the original upload and
+    # any generated thumbnails follow.
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        fid = str(f.get("_id") or "")
+        if fid and fid in preview_file_ids:
+            continue
+        if public_file_path and fid and fid == single_id:
+            url = public_file_path
+        else:
+            url = _file_url_from_rc(f)
+        add(
             AttachmentCandidate(
-                url=_file_url_from_rc(f, message),
+                url=url,
                 mime_type=f.get("type", ""),
                 title=f.get("name", ""),
-                rc_file_id=f.get("_id", ""),
+                rc_file_id=fid,
             )
         )
 
-    # file field (single object, older Rocket.Chat)
-    single = message.get("file")
-    if single:
-        candidates.append(
+    # `file` is deprecated but still present on older messages and some
+    # integrations.  `add()` drops it when `files` already covered the id.
+    if single is not None:
+        add(
             AttachmentCandidate(
-                url=_file_url_from_rc(single, message),
+                url=public_file_path or _file_url_from_rc(single),
                 mime_type=single.get("type", ""),
                 title=single.get("name", ""),
-                rc_file_id=single.get("_id", ""),
+                rc_file_id=single_id,
+            )
+        )
+
+    # Rich attachments: link previews, or old messages that only carry
+    # `attachments`.  File attachments already represented by `files` or
+    # `file` are skipped by `add()` through their file id.
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        if att.get("type") == "file":
+            # For file attachments `title_link` is the original upload while
+            # `image_url` may be a generated thumbnail.
+            url = att.get("title_link") or att.get("image_url") or ""
+        else:
+            url = att.get("image_url") or att.get("title_link") or ""
+        if not url:
+            continue
+        file_id = att.get("fileId") or ""
+        if not file_id:
+            nested_file = att.get("file")
+            if isinstance(nested_file, dict):
+                file_id = nested_file.get("_id") or ""
+        add(
+            AttachmentCandidate(
+                url=url,
+                mime_type=att.get("image_type", ""),
+                title=att.get("title", ""),
+                rc_file_id=str(file_id or ""),
             )
         )
 
     return candidates
 
 
-def _file_url_from_rc(file_obj: dict, message: dict) -> str:
-    """Build a Rocket.Chat file download URL from a file object."""
-    rid = message.get("rid", "")
-    fid = file_obj.get("_id", "")
-    if fid and rid:
-        return f"/file-upload/{rid}/{fid}/{file_obj.get('name', 'file')}"
-    return ""
+def _file_url_from_rc(file_obj: dict) -> str:
+    """Build Rocket.Chat's current file download URL from a file object.
+
+    Rocket.Chat 9.0 serves files at ``/file-upload/{fileId}/{name}`` (the
+    old ``/ufs/...`` path is gone).  The route takes the first path segment
+    as the upload id; adding the room id first makes every lookup 404.
+    """
+    fid = str(file_obj.get("_id") or "")
+    if not fid:
+        return ""
+    name = str(file_obj.get("name") or "file")
+    return f"/file-upload/{fid}/{quote(name, safe='')}"
 
 
 def classify_attachment(candidate: AttachmentCandidate) -> str:
@@ -2229,14 +2359,19 @@ class WebSocketTransport:
 
     @staticmethod
     def _is_auth_error(exc: Exception) -> bool:
-        """Heuristic: does this error indicate the resume token is invalid?"""
+        """Heuristic: does this error indicate a rejected session/token?
+
+        DDP login failures are always auth failures even when the server
+        reports them as 403, while ordinary REST permission errors must not
+        be mistaken for auth failures after Rocket.Chat 9.0 standardised
+        refused requests on 403.
+        """
         text = str(exc).lower()
         return (
-            "auth" in text
-            or "401" in text
-            or "unauthorized" in text
-            or "token" in text
-            or "resume" in text
+            "ddp login failed" in text
+            or "resume token" in text
+            or "authentication failed" in text
+            or "auth error" in text
             or _is_auth_failure_message(text)
         )
 
@@ -2688,10 +2823,11 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             await self._client.initialize()
         except RocketChatClientError as exc:
             log.error("Rocket.Chat authentication failed: %s", exc)
-            # A definitive credential problem (401/403, invalid token/response)
+            # A definitive credential problem (401, invalid token/response)
             # can never succeed by retrying — report it as non-retryable so the
             # gateway exits instead of reconnecting forever.  Transient network
-            # failures stay retryable and return False without fatal metadata.
+            # failures and ordinary 403 permission refusals stay retryable and
+            # return False without fatal metadata.
             if _is_auth_failure_message(str(exc)):
                 self._mark_auth_fatal(str(exc))
             return False
@@ -2994,7 +3130,7 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
             # Legacy media_files shim: deliver file attachments natively too
             # (Hermes' MEDIA: contract uses the dedicated send_* methods, but
             # direct callers may pass media_files to send()).
-            for media_path in media_files or []:
+            for media_path in _normalize_media_files(media_files):
                 media_result = await self._send_media_file(
                     chat_id,
                     media_path,
@@ -3871,20 +4007,22 @@ class RocketChatAdapter(BasePlatformAdapter):  # type: ignore[reportGeneralTypeI
 def _is_auth_failure_message(message: str) -> bool:
     """Return True when an error string indicates a definitive auth failure.
 
-    Matches HTTP 401/403 responses and Rocket.Chat's invalid-token/credential
-    phrasing.  Transient failures (timeouts, connection refused, or malformed
-    200 responses while a server/proxy is restarting) never match, so the
-    gateway keeps them retryable.
+    Rocket.Chat 9.0 uses 401 for missing/invalid sessions and 403 for every
+    refused request, including ordinary permission denials.  Only 401 and
+    explicit credential phrasing count as auth failures here; treating 403
+    as auth would trigger needless re-authentication (and 403 loops) for
+    permission errors, ABAC-locked rooms, and invalid DM recipients.
     """
     lowered = str(message).lower()
     markers = (
         "401",
-        "403",
+        "unauthenticated",
         "unauthorized",
-        "forbidden",
         "invalid token",
-        "invalid-user",
-        "invalid user",
+        "invalid-token",
+        "invalid session",
+        "token expired",
+        "session expired",
         "you must be logged in",
         "totp-required",
     )
@@ -3997,15 +4135,52 @@ async def resolve_delivery_target(client: Any, target: str) -> str:
     return target
 
 
+def _normalize_media_files(media_files: Any) -> list[str]:
+    """Normalize Hermes media descriptors to local path strings.
+
+    Hermes passes ``[(path, is_voice), ...]`` from ``extract_media``; direct
+    callers and tests may pass plain paths.  Accept both, plus PathLike
+    values, and drop malformed entries.
+    """
+    if media_files is None:
+        return []
+    if isinstance(media_files, (str, os.PathLike)):
+        media_files = [media_files]
+    elif (
+        isinstance(media_files, tuple)
+        and len(media_files) == 2
+        and isinstance(media_files[1], bool)
+    ):
+        media_files = [media_files]
+
+    paths: list[str] = []
+    for item in media_files:
+        if isinstance(item, (tuple, list)):
+            if not item:
+                continue
+            item = item[0]
+        try:
+            path = os.fspath(item)
+        except TypeError:
+            continue
+        if isinstance(path, bytes):
+            path = os.fsdecode(path)
+        if path:
+            paths.append(path)
+    return paths
+
+
 async def standalone_send(
-    pconfig: dict[str, Any],
+    pconfig: Any,
     chat_id: str,
     message: str,
-    media_files: list[str] | None = None,
+    media_files: Any = None,
     *,
     thread_id: str | None = None,
     force_document: bool = False,
+    caption: str | None = None,
     _client_factory: Any = None,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """Send a message from a standalone context (cron job, external trigger).
 
@@ -4062,21 +4237,31 @@ async def standalone_send(
         tmid = str(thread_id or "")
         message_id = ""
 
-        # Upload media files if any
-        if media_files:
-            for file_path in media_files:
-                upload_attachment: Any = client.upload_attachment
-                uploaded = await upload_attachment(
-                    room_id=room_id,
-                    file_path=file_path,
-                    text=message,
-                    tmid=tmid,
-                )
-                message_id = uploaded.get("_id", message_id)
+        media_paths = _normalize_media_files(media_files)
+        caption_text = str(caption or "")
 
-        # Post text message (even when media was uploaded — may serve as caption)
+        # Upload media files if any.  mediaConfirm already creates a message
+        # per upload, so put the caption on the first attachment and send the
+        # remaining text once below instead of duplicating it per file.
+        for index, file_path in enumerate(media_paths):
+            upload_attachment: Any = client.upload_attachment
+            uploaded = await upload_attachment(
+                room_id=room_id,
+                file_path=file_path,
+                text=caption_text if index == 0 else "",
+                tmid=tmid,
+            )
+            message_id = uploaded.get("_id", message_id)
+
+        # Post the text message once, after any media uploads.  When Hermes
+        # supplies a media caption, it already rides on the first upload.
         if message:
             result = await client.post_message(room_id=room_id, text=message, tmid=tmid)
+            message_id = result.get("_id", message_id)
+        elif caption_text and not media_paths:
+            result = await client.post_message(
+                room_id=room_id, text=caption_text, tmid=tmid
+            )
             message_id = result.get("_id", message_id)
 
         return {"success": True, "message_id": message_id}

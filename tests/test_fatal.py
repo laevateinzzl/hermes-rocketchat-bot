@@ -12,6 +12,7 @@ from adapter import (
     RocketChatClientError,
     RocketChatConfig,
     WebSocketTransport,
+    _is_auth_failure_message,
 )
 
 
@@ -215,3 +216,45 @@ async def test_adapter_transport_failed_status_notifies_gateway_retryable():
     assert adapter.fatal_error_retryable
     assert notified == [True]
 
+
+# ---------------------------------------------------------------------------
+# 9.0 status-code semantics: 401 = auth, 403 = permission/refusal
+# ---------------------------------------------------------------------------
+
+
+def test_401_is_auth_failure():
+    assert _is_auth_failure_message(
+        "GET /api/v1/me failed: HTTP 401: error-unauthenticated"
+    )
+
+
+def test_403_permission_error_is_not_auth_failure():
+    assert not _is_auth_failure_message(
+        "POST /api/v1/chat.postMessage failed: HTTP 403: "
+        '{"errorType":"error-forbidden","error":"error-not-allowed"}'
+    )
+
+
+def test_invalid_dm_recipient_is_not_auth_failure():
+    assert not _is_auth_failure_message(
+        'POST /api/v1/dm.create failed: HTTP 400: {"errorType":"error-invalid-user"}'
+    )
+
+
+def test_totp_required_is_auth_failure():
+    assert _is_auth_failure_message("Password login failed: HTTP 401: totp-required")
+
+
+def test_ddp_login_403_is_still_an_auth_error():
+    """DDP resume-token rejection uses 403 but must trigger re-auth."""
+    exc = RocketChatClientError(
+        "DDP login failed (resume token rejected): Please log in again. [403]"
+    )
+    assert WebSocketTransport._is_auth_error(exc)
+
+
+def test_rest_403_is_not_a_websocket_auth_error():
+    exc = RocketChatClientError(
+        "POST /api/v1/chat.postMessage failed: HTTP 403: error-forbidden"
+    )
+    assert not WebSocketTransport._is_auth_error(exc)

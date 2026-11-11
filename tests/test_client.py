@@ -285,6 +285,44 @@ async def test_rate_limit_response_raises_retry_after_error():
 
 
 @pytest.mark.asyncio
+async def test_sync_messages_uses_9_0_get_contract():
+    """9.0: GET query params and a nested result.{updated,deleted} body."""
+    session = FakeSession(
+        responses=[
+            FakeResponse(
+                json_data={
+                    "success": True,
+                    "result": {
+                        "updated": [
+                            {"_id": "m1", "msg": "new"},
+                            {"_id": "m2", "msg": "newer"},
+                        ],
+                        "deleted": [
+                            {"_id": "m-old", "_deletedAt": "2026-11-01T00:00:00Z"}
+                        ],
+                    },
+                }
+            )
+        ]
+    )
+    client = FakeClient(session)
+
+    data = await client.sync_messages(
+        "room-abc", last_update="2026-11-01T00:00:00.000Z", room_type="d"
+    )
+
+    assert [msg["_id"] for msg in data["updated"]] == ["m1", "m2"]
+    assert data["removed"] == [{"_id": "m-old", "_deletedAt": "2026-11-01T00:00:00Z"}]
+    req = session.requests[0]
+    assert req["method"] == "GET"
+    assert "/api/v1/chat.syncMessages" in req["url"]
+    assert req["params"] == {
+        "roomId": "room-abc",
+        "lastUpdate": "2026-11-01T00:00:00.000Z",
+    }
+
+
+@pytest.mark.asyncio
 async def test_sync_messages_falls_back_to_room_history_when_sync_endpoint_missing():
     """Older Rocket.Chat servers can lack chat.syncMessages but support history."""
     session = FakeSession(
@@ -312,8 +350,12 @@ async def test_sync_messages_falls_back_to_room_history_when_sync_endpoint_missi
     assert [msg["_id"] for msg in data["updated"]] == ["old-msg", "new-msg"]
     assert data["removed"] == []
     sync_req = session.requests[0]
-    assert sync_req["method"] == "POST"
+    assert sync_req["method"] == "GET"
     assert "/api/v1/chat.syncMessages" in sync_req["url"]
+    assert sync_req["params"] == {
+        "roomId": "room-abc",
+        "lastUpdate": "2026-07-01T01:30:00.000Z",
+    }
     history_req = session.requests[1]
     assert history_req["method"] == "GET"
     assert "/api/v1/im.history" in history_req["url"]
@@ -383,9 +425,7 @@ async def test_upload_attachment_sends_real_multipart_file():
                 FakeResponse(
                     json_data={"success": True, "file": {"_id": "f1", "name": "x.png"}}
                 ),
-                # rooms.mediaConfirm
-                FakeResponse(json_data={"success": True}),
-                # chat.postMessage
+                # rooms.mediaConfirm — creates and sends the file message
                 FakeResponse(json_data={"success": True, "message": {"_id": "m1"}}),
             ]
         )
@@ -396,6 +436,7 @@ async def test_upload_attachment_sends_real_multipart_file():
         )
 
         assert result["_id"] == "m1"
+        assert len(session.requests) == 2
         media_call = session.requests[0]
         assert "rooms.media" in media_call["url"]
         # A real multipart payload (httpx-style files= for non-aiohttp fake
@@ -406,6 +447,37 @@ async def test_upload_attachment_sends_real_multipart_file():
         assert media_call["files"]["file"][2] == "image/png"
         # Credentials ride the default headers on every step.
         assert media_call["headers"]["X-Auth-Token"] == "test-access-token"
+
+        confirm_call = session.requests[1]
+        assert "rooms.mediaConfirm/room-1/f1" in confirm_call["url"]
+        assert confirm_call["json"] == {"msg": "caption", "tmid": "t-1"}
+        # chat.postMessage must NOT be called: 9.0 rejects the `file` field,
+        # and mediaConfirm has already created the message.
+        assert not any("chat.postMessage" in req["url"] for req in session.requests)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_upload_attachment_requires_file_id():
+    """A 2xx upload without a file id must fail instead of posting text only."""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp.write(b"fake-image-bytes")
+        tmp_path = tmp.name
+
+    try:
+        session = FakeSession(
+            responses=[FakeResponse(json_data={"success": True, "file": {}})]
+        )
+        client = FakeClient(session)
+
+        with pytest.raises(RocketChatClientError, match="no file id"):
+            await client.upload_attachment(room_id="room-1", file_path=tmp_path)
+
+        assert len(session.requests) == 1
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
@@ -421,11 +493,11 @@ async def test_download_attachment_joins_relative_url():
     session = FakeSession(responses=[FakeResponse(status=200, text_data=b"img")])
     client = FakeClient(session)
 
-    data = await client.download_attachment("/file-upload/room-1/f1/notes.txt")
+    data = await client.download_attachment("/file-upload/f1/notes.txt")
 
     assert data == b"img"
     req = session.requests[0]
-    assert req["url"] == "https://chat.example.com/file-upload/room-1/f1/notes.txt"
+    assert req["url"] == "https://chat.example.com/file-upload/f1/notes.txt"
     # Same-origin: bot credentials are attached.
     assert req["headers"]["X-User-Id"] == "test-bot-id"
     assert req["headers"]["X-Auth-Token"] == "test-access-token"

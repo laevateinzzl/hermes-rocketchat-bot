@@ -10,7 +10,6 @@ from adapter import (
     sanitize_filename,
 )
 
-
 # ---------------------------------------------------------------------------
 # Classification tests
 # ---------------------------------------------------------------------------
@@ -109,6 +108,7 @@ def test_normalize_file_field():
     assert candidates[0].title == "screenshot.png"
     assert candidates[0].mime_type == "image/png"
     assert candidates[0].rc_file_id == "file1"
+    assert candidates[0].url == "/file-upload/file1/screenshot.png"
 
 
 def test_normalize_files_field():
@@ -124,7 +124,135 @@ def test_normalize_files_field():
 
     assert len(candidates) == 2
     assert candidates[0].rc_file_id == "f1"
+    assert candidates[0].url == "/file-upload/f1/img1.png"
     assert candidates[1].rc_file_id == "f2"
+    assert candidates[1].url == "/file-upload/f2/img2.jpg"
+
+
+def test_normalize_9_0_message_deduplicates_same_upload():
+    """9.0 populates file + files + attachments for one upload; emit one."""
+    message = {
+        "_id": "msg1",
+        "rid": "room-1",
+        "file": {"_id": "f1", "name": "photo.png", "type": "image/png"},
+        "files": [{"_id": "f1", "name": "photo.png", "type": "image/png"}],
+        "attachments": [
+            {
+                "type": "file",
+                "title": "photo.png",
+                "image_url": "/file-upload/f1/photo.png",
+                "image_type": "image/png",
+                "fileId": "f1",
+            }
+        ],
+    }
+
+    candidates = attachment_candidates_from_message(message)
+
+    assert len(candidates) == 1
+    assert candidates[0].rc_file_id == "f1"
+    assert candidates[0].url == "/file-upload/f1/photo.png"
+    assert candidates[0].title == "photo.png"
+
+
+def test_9_0_thumbnail_is_not_emitted_alongside_original():
+    """A generated preview must not replace or duplicate the original image."""
+    message = {
+        "_id": "msg1",
+        "rid": "room-1",
+        "file": {"_id": "f1", "name": "photo.png", "type": "image/png"},
+        "files": [
+            {"_id": "f1", "name": "photo.png", "type": "image/png"},
+            {
+                "_id": "thumb1",
+                "name": "photo.png.jpg",
+                "type": "image/jpeg",
+            },
+        ],
+        "attachments": [
+            {
+                "type": "file",
+                "title": "photo.png",
+                "title_link": "/file-upload/f1/photo.png",
+                "image_url": "/file-upload/thumb1/photo.png.jpg",
+                "image_type": "image/jpeg",
+                "fileId": "f1",
+            }
+        ],
+    }
+
+    candidates = attachment_candidates_from_message(message)
+
+    assert len(candidates) == 1
+    assert candidates[0].rc_file_id == "f1"
+    assert candidates[0].url == "/file-upload/f1/photo.png"
+
+
+def test_files_field_wins_over_deprecated_file_field():
+    message = {
+        "_id": "msg1",
+        "rid": "room-1",
+        "file": {"_id": "f1", "name": "photo.png", "type": "image/png"},
+        "files": [{"_id": "f1", "name": "photo.png", "type": "image/png"}],
+    }
+
+    candidates = attachment_candidates_from_message(message)
+
+    assert len(candidates) == 1
+    assert candidates[0].rc_file_id == "f1"
+
+
+def test_file_upload_public_path_is_preferred():
+    message = {
+        "_id": "msg1",
+        "rid": "room-1",
+        "file": {"_id": "f1", "name": "photo.png", "type": "image/png"},
+        "files": [{"_id": "f1", "name": "photo.png", "type": "image/png"}],
+        "fileUpload": {
+            "publicFilePath": "https://chat.example.com/file-upload/f1/photo.png"
+        },
+    }
+
+    candidates = attachment_candidates_from_message(message)
+
+    assert len(candidates) == 1
+    assert candidates[0].url == "https://chat.example.com/file-upload/f1/photo.png"
+
+
+def test_file_url_encodes_file_name():
+    message = {
+        "_id": "msg1",
+        "rid": "room-1",
+        "files": [{"_id": "f1", "name": "a b#c.png", "type": "image/png"}],
+    }
+
+    candidates = attachment_candidates_from_message(message)
+
+    assert len(candidates) == 1
+    assert candidates[0].url == "/file-upload/f1/a%20b%23c.png"
+
+
+def test_attachment_only_file_prefers_original_url():
+    """Old messages may have only attachments; do not pick the thumbnail."""
+    message = {
+        "_id": "msg1",
+        "attachments": [
+            {
+                "type": "file",
+                "title": "photo.png",
+                "title_link": "/file-upload/f1/photo.png",
+                "image_url": "/file-upload/thumb1/photo.png.jpg",
+                "image_type": "image/jpeg",
+                "fileId": "f1",
+            }
+        ],
+    }
+
+    candidates = attachment_candidates_from_message(message)
+
+    assert len(candidates) == 1
+    assert candidates[0].url == "/file-upload/f1/photo.png"
+    assert candidates[0].rc_file_id == "f1"
 
 
 def test_empty_message_no_candidates():
@@ -222,7 +350,7 @@ async def test_resolve_media_text_attachment_not_inlined():
     assert len(media_urls) == 1
     assert media_types == ["document"]
     # Relative /file-upload/... paths are absolutized against the server.
-    assert media_urls == ["http://rc/file-upload/room-1/f1/notes.txt"]
+    assert media_urls == ["http://rc/file-upload/f1/notes.txt"]
     assert media_text_inlined == [False]
 
 

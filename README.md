@@ -288,9 +288,10 @@ credentials are present in the environment.
 Hermes' `MEDIA:` delivery contract is fully supported: every outbound media
 send (`send_image_file`, `send_document`, `send_video`, `send_voice`,
 `send_animation`, and batched `send_multiple_images`) uploads the file to
-Rocket.Chat via the `rooms.media` → `rooms.mediaConfirm` → `chat.postMessage`
-flow, so file attachments from the agent arrive as real downloads — no
-"couldn't deliver" fallbacks.
+Rocket.Chat via the `rooms.media` → `rooms.mediaConfirm` flow. `mediaConfirm`
+creates the file message itself, so no follow-up `chat.postMessage` with a
+`file` field is sent (Rocket.Chat 9.0 rejects that field). File attachments
+from the agent arrive as real downloads — no "couldn't deliver" fallbacks.
 
 - Local files, `file://` URIs (what the gateway passes for MEDIA delivery),
   and http(s) image URLs are all accepted.
@@ -326,6 +327,25 @@ python -m ruff check .
 | "Not connected" errors | Check server URL is reachable and credentials are valid |
 
 ## Changelog
+
+### 0.3.1 (2026-11-11) — Rocket.Chat 9.0 compatibility
+
+- **Inbound attachments** — build Rocket.Chat's current
+  `/file-upload/{fileId}/{name}` URL (the old room-prefixed path 404s),
+  prefer `fileUpload.publicFilePath`, URL-encode file names, and deduplicate
+  the `file` / `files` / `attachments` forms that 9.0 sets for one upload.
+- **Outbound media** — `rooms.mediaConfirm` already creates the file
+  message, so stop the follow-up `chat.postMessage` with a `file` field
+  (9.0 rejects it with HTTP 400). `standalone_send` no longer duplicates the
+  caption when media and text are both present.
+- **Polling** — use the 9.0 `GET /api/v1/chat.syncMessages` contract and
+  unwrap its nested `result.updated` / `result.deleted` response.
+- **Auth errors** — treat only HTTP 401 and explicit credential failures as
+  auth failures. 9.0 uses 403 for every refused request, including ordinary
+  permission denials, which must not trigger re-authentication.
+- **Hermes standalone sender** — accept `gateway.config.PlatformConfig`
+  objects and Hermes' `(path, is_voice)` media descriptors, and honour the
+  `caption=` kwarg used by captionable media sends.
 
 ### 0.3.0 (2026-09-01) — audit-driven hardening
 

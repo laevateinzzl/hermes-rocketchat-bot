@@ -1,16 +1,17 @@
 """Tests for outbound file upload and standalone sender."""
 
-import pytest
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from adapter import (
     RocketChatClient,
     RocketChatClientError,
+    _normalize_media_files,
     resolve_delivery_target,
     standalone_send,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fake session and client for upload tests
@@ -113,12 +114,7 @@ async def test_upload_attachment_calls_rooms_media_and_confirm():
                         },
                     },
                 ),
-                # rooms.mediaConfirm response
-                FakeUploadResponse(
-                    status=200,
-                    json_data={"success": True},
-                ),
-                # chat.postMessage response
+                # rooms.mediaConfirm response — creates and sends the message
                 FakeUploadResponse(
                     status=200,
                     json_data={"success": True, "message": {"_id": "msg-upload-1"}},
@@ -135,6 +131,7 @@ async def test_upload_attachment_calls_rooms_media_and_confirm():
         )
 
         assert result["_id"] == "msg-upload-1"
+        assert len(session.requests) == 2
 
         # Verify rooms.media was called
         media_call = session.requests[0]
@@ -144,13 +141,14 @@ async def test_upload_attachment_calls_rooms_media_and_confirm():
         assert "json" not in media_call
         assert "files" in media_call or "data" in media_call
 
-        # Verify rooms.mediaConfirm was called
+        # Verify rooms.mediaConfirm was called with the caption + thread id
         confirm_call = session.requests[1]
         assert "rooms.mediaConfirm" in confirm_call["url"]
+        assert confirm_call["json"] == {"msg": "here is an image", "tmid": "thread-1"}
 
-        # Verify chat.postMessage was called with file info
-        post_call = session.requests[2]
-        assert "chat.postMessage" in post_call["url"]
+        # chat.postMessage with a `file` field must NOT be called: 9.0
+        # rejects it, and mediaConfirm already sent the file message.
+        assert not any("chat.postMessage" in req["url"] for req in session.requests)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
@@ -224,11 +222,10 @@ async def test_standalone_send_accepts_thread_and_force_document():
                     status=200,
                     json_data={"success": True, "file": {"_id": "f1", "name": "x.png"}},
                 ),
-                # rooms.mediaConfirm
-                FakeUploadResponse(status=200, json_data={"success": True}),
-                # chat.postMessage (file ref with caption)
+                # rooms.mediaConfirm — sends the file message with caption
                 FakeUploadResponse(
-                    status=200, json_data={"success": True, "message": {"_id": "m1"}}
+                    status=200,
+                    json_data={"success": True, "message": {"_id": "m1"}},
                 ),
                 # chat.postMessage (text)
                 FakeUploadResponse(
@@ -247,7 +244,7 @@ async def test_standalone_send_accepts_thread_and_force_document():
             },
             chat_id="room-thread-1",
             message="threaded delivery",
-            media_files=[tmp_path],
+            media_files=[(tmp_path, False)],
             thread_id="thread-9",
             force_document=False,
             _client_factory=lambda: client,
@@ -255,16 +252,93 @@ async def test_standalone_send_accepts_thread_and_force_document():
 
         assert result["success"]
 
-        # mediaConfirm carries the thread id
+        # mediaConfirm carries the thread id, but not the caption: the text
+        # is sent once below so it is not duplicated per media file.
         confirm = [r for r in session.requests if "mediaConfirm" in r["url"]]
         assert confirm
-        assert confirm[0]["json"]["tmid"] == "thread-9"
+        assert confirm[0]["json"] == {"msg": "", "tmid": "thread-9"}
 
-        # every postMessage carries the thread id
+        # mediaConfirm already posts the file message; only the separate
+        # text message should hit chat.postMessage, exactly once.
         posts = [r for r in session.requests if "chat.postMessage" in r["url"]]
-        assert len(posts) == 2
-        for post in posts:
-            assert post["json"]["tmid"] == "thread-9"
+        assert len(posts) == 1
+        assert posts[0]["json"] == {
+            "roomId": "room-thread-1",
+            "text": "threaded delivery",
+            "tmid": "thread-9",
+        }
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def test_normalize_media_files_accepts_hermes_descriptors():
+    """Hermes passes [(path, is_voice), ...]; direct callers may pass strings."""
+    from pathlib import Path
+
+    assert _normalize_media_files(
+        [("/tmp/a.png", False), "/tmp/b.pdf", (Path("/tmp/c.mp3"), True)]
+    ) == ["/tmp/a.png", "/tmp/b.pdf", "/tmp/c.mp3"]
+    assert _normalize_media_files("/tmp/single.png") == ["/tmp/single.png"]
+    assert _normalize_media_files(("/tmp/voice.ogg", True)) == ["/tmp/voice.ogg"]
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_uses_hermes_caption_on_first_media():
+    """Hermes' captionable media path passes message='' + caption=... ."""
+    import adapter as adapter_module
+
+    adapter_module._delivery_room_cache.clear()
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp.write(b"fake-image-data")
+        tmp_path = tmp.name
+
+    try:
+        session = FakeUploadSession(
+            responses=[
+                FakeUploadResponse(
+                    status=200,
+                    json_data={"success": True, "_id": "bot1", "username": "hermesbot"},
+                ),
+                FakeUploadResponse(
+                    status=200,
+                    json_data={"success": True, "room": {"_id": "room-caption-1"}},
+                ),
+                FakeUploadResponse(
+                    status=200,
+                    json_data={"success": True, "file": {"_id": "f1", "name": "x.png"}},
+                ),
+                FakeUploadResponse(
+                    status=200,
+                    json_data={"success": True, "message": {"_id": "m1"}},
+                ),
+            ]
+        )
+        client = FakeUploadClient(session)
+
+        result = await standalone_send(
+            pconfig={
+                "server_url": "https://chat.example.com",
+                "auth_mode": "token",
+                "user_id": "bot1",
+                "access_token": "tok",
+            },
+            chat_id="room-caption-1",
+            message="",
+            media_files=[(tmp_path, False)],
+            caption="caption from Hermes",
+            thread_id="thread-9",
+            _client_factory=lambda: client,
+        )
+
+        assert result == {"success": True, "message_id": "m1"}
+        confirm = [r for r in session.requests if "mediaConfirm" in r["url"]]
+        assert confirm
+        assert confirm[0]["json"] == {
+            "msg": "caption from Hermes",
+            "tmid": "thread-9",
+        }
+        # The caption rides on the first upload; no empty duplicate text post.
+        assert not any("chat.postMessage" in req["url"] for req in session.requests)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 

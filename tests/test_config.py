@@ -1,5 +1,7 @@
 """Tests for configuration parsing (RocketChatConfig, parse_config, env_enablement)."""
 
+from types import SimpleNamespace
+
 from adapter import env_enablement, parse_config
 
 
@@ -65,6 +67,30 @@ def test_extra_overrides_env_for_explicit_keys(monkeypatch):
     # auth_mode and access_token only come from env
     assert cfg.auth_mode == "token"
     assert cfg.access_token == "env_tok"
+
+
+def test_parse_config_accepts_hermes_platform_config_object(monkeypatch):
+    """Hermes' standalone sender receives PlatformConfig, not a dict."""
+    monkeypatch.delenv("ROCKETCHAT_SERVER_URL", raising=False)
+    monkeypatch.delenv("ROCKETCHAT_USER_ID", raising=False)
+    monkeypatch.delenv("ROCKETCHAT_ACCESS_TOKEN", raising=False)
+    pconfig = SimpleNamespace(
+        extra={
+            "server_url": "https://chat.example.com",
+            "auth_mode": "token",
+            "user_id": "u1",
+            "access_token": "tok",
+            "transport": "websocket",
+        }
+    )
+
+    cfg = parse_config(pconfig)
+
+    assert cfg.server_url == "https://chat.example.com"
+    assert cfg.auth_mode == "token"
+    assert cfg.user_id == "u1"
+    assert cfg.access_token == "tok"
+    assert cfg.transport == "websocket"
 
 
 def test_env_enablement_returns_seed_when_minimally_configured(monkeypatch):
